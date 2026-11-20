@@ -2,7 +2,7 @@
 /**
  * Debug CLI outside OpenCode:
  *   bun bin/tutor.ts --app Keynote "add a new slide"
- *   bun bin/tutor.ts --verify --app Finder "create a new folder"   # also read back the agent cursor
+ *   bun bin/tutor.ts --verify --app TextEdit "create a new document"   # also read back the agent cursor
  */
 import { loadConfig } from '../src/config.js';
 import { Tutor } from '../src/tutor.js';

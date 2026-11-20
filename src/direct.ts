@@ -3,20 +3,20 @@
  *
  * Architecture:
  * - The `cua-tutor` provider exposes ONE visible model in OpenCode's picker (`CUA Tutor -> Tutor`,
- *   `cua-tutor/tutor`) and ONE hidden fallback model (`cua-tutor/fallback`, cloned from the
- *   required `fallbackModel` plugin option).
+ *   `cua-tutor/tutor`) and ONE hidden System 2 model (`cua-tutor/system2`, cloned from the
+ *   required `system2Model` plugin option).
  * - On every request for `cua-tutor/tutor`, `experimental.model.resolve` runs `decideTutorRoute`:
- *   1. Tool-result / assistant continuations -> route immediately to `cua-tutor/fallback` (0 ms).
+ *   1. Tool-result / assistant continuations -> route immediately to `cua-tutor/system2` (0 ms).
  *   2. Fresh user prompt -> ~90 ms 4-Noul Jev Intent Gate (0 screenshots):
  *      - `explicit_do_for_me` >= 0.7 -> instant point-only notice via `LanguageModelV3` (0 LLM tokens).
- *      - `is_conceptual_or_chat` >= 0.65 && `wants_ui_pointer` < 0.5 -> route to `cua-tutor/fallback`
+ *      - `is_conceptual_or_chat` >= 0.65 && `wants_ui_pointer` < 0.5 -> route to `cua-tutor/system2`
  *        for a FULL native OpenCode agent loop (`tutor_set_app`, `websearch`, `webfetch`, `tutor_highlight`, etc.).
  *      - UI pointer request when `sessionApp` is set (or explicitly named & open) -> run System 1
  *        (`Tutor.highlight`) directly:
  *          - HIT  -> serve instant pointer reply via `LanguageModelV3` (ZERO System-2 tokens).
- *          - MISS -> route to `cua-tutor/fallback` with System-1 miss diagnostics injected into
+ *          - MISS -> route to `cua-tutor/system2` with System-1 miss diagnostics injected into
  *                    `session.hook("context")` so System 2 can coach, search docs, or highlight a prerequisite.
- *      - UI pointer request when `sessionApp` is NOT set yet -> route to `cua-tutor/fallback` so
+ *      - UI pointer request when `sessionApp` is NOT set yet -> route to `cua-tutor/system2` so
  *        System 2 can call `tutor_set_app` (if an app was named) or ask which app the user wants to learn.
  * - Outside `Tutor`, `session.hook("context")` strips `tutor_set_app` and `tutor_highlight` from
  *   `event.tools` and injects zero guidance, keeping non-Tutor sessions 100% untouched.
@@ -28,7 +28,7 @@ import type { HighlightResult } from './tutor.js';
 
 export const DIRECT_PROVIDER_ID = 'cua-tutor';
 export const DIRECT_MODEL_ID = 'tutor';
-export const DIRECT_FALLBACK_MODEL_ID = 'fallback';
+export const DIRECT_SYSTEM2_MODEL_ID = 'system2';
 export const DIRECT_MODEL_NAME = 'Tutor';
 
 export type DirectTutorLike = {
@@ -182,7 +182,7 @@ export function formatSystem1Success(r: HighlightResult, gateMs?: number): strin
 
 export type RouteDecision =
   | {
-      target: 'fallback';
+      target: 'system2';
       userMessageID?: string;
       miss?: HighlightResult;
       intent?: IntentSignals;
@@ -200,7 +200,7 @@ export type RouteDecision =
 
 /**
  * Decide whether a `cua-tutor/tutor` request is handled directly by System 1 (zero LLM tokens)
- * or routed natively to `cua-tutor/fallback` for a full OpenCode tool-calling System-2 loop.
+ * or routed natively to `cua-tutor/system2` for a full OpenCode tool-calling System-2 loop.
  */
 export async function decideTutorRoute(args: {
   messages: readonly unknown[];
@@ -209,7 +209,7 @@ export async function decideTutorRoute(args: {
   onSessionApp?: (app: string | undefined) => void;
   tutor: DirectTutorLike;
   intentClassifier?: IntentClassifier;
-  hasFallbackModel: boolean;
+  hasSystem2Model: boolean;
   signal?: AbortSignal;
 }): Promise<RouteDecision> {
   const inspected = inspectSessionMessages(args.messages);
@@ -226,14 +226,14 @@ export async function decideTutorRoute(args: {
     inspected.isContinuation ||
     (inspected.userMessageID && inspected.userMessageID === args.lastRoutedUserMessageID)
   ) {
-    if (args.hasFallbackModel) {
-      return { target: 'fallback', userMessageID: inspected.userMessageID, sessionApp: activeApp };
+    if (args.hasSystem2Model) {
+      return { target: 'system2', userMessageID: inspected.userMessageID, sessionApp: activeApp };
     }
     return {
       target: 'system1',
       route: 'conceptual',
       userMessageID: inspected.userMessageID,
-      text: 'System-2 fallback is disabled.',
+      text: 'System 2 is disabled.',
       pointed: false,
       sessionApp: activeApp,
     };
@@ -243,8 +243,8 @@ export async function decideTutorRoute(args: {
   if (explicitApp) rememberApp(explicitApp);
 
   if (!step) {
-    if (args.hasFallbackModel) {
-      return { target: 'fallback', userMessageID: inspected.userMessageID, sessionApp: activeApp };
+    if (args.hasSystem2Model) {
+      return { target: 'system2', userMessageID: inspected.userMessageID, sessionApp: activeApp };
     }
     return {
       target: 'system1',
@@ -285,15 +285,15 @@ export async function decideTutorRoute(args: {
 
   // Route B: Conceptual / chat / app intro / research -> native System-2 OpenCode agent loop
   if (intent && intent.isConceptualOrChat >= 0.65 && intent.wantsUiPointer < 0.5) {
-    if (args.hasFallbackModel) {
-      return { target: 'fallback', userMessageID: inspected.userMessageID, intent, sessionApp: activeApp };
+    if (args.hasSystem2Model) {
+      return { target: 'system2', userMessageID: inspected.userMessageID, intent, sessionApp: activeApp };
     }
     return {
       target: 'system1',
       route: 'conceptual',
       userMessageID: inspected.userMessageID,
       text:
-        'That looks like a conceptual question rather than a single on-screen control, and System-2 fallback is disabled.\n\n' +
+        'That looks like a conceptual question rather than a single on-screen control, and System 2 is disabled.\n\n' +
         `<sub>Jev intent gate (${intent.latencyMs} ms · conceptual=${intent.isConceptualOrChat.toFixed(2)}) · 0 screenshots</sub>`,
       pointed: false,
       intent,
@@ -314,8 +314,8 @@ export async function decideTutorRoute(args: {
 
   // Hard gate: no app set for this session yet -> let System 2 call `tutor_set_app` (or ask the user)
   if (!targetApp) {
-    if (args.hasFallbackModel) {
-      return { target: 'fallback', userMessageID: inspected.userMessageID, intent, sessionApp: activeApp };
+    if (args.hasSystem2Model) {
+      return { target: 'system2', userMessageID: inspected.userMessageID, intent, sessionApp: activeApp };
     }
     const gateNote = intent ? `\n\n<sub>Jev intent gate (${intent.latencyMs} ms) · 0 screenshots</sub>` : '';
     return {
@@ -349,9 +349,9 @@ export async function decideTutorRoute(args: {
     };
   }
 
-  if (args.hasFallbackModel && shouldEscalateToSystem2(s1)) {
+  if (args.hasSystem2Model && shouldEscalateToSystem2(s1)) {
     return {
-      target: 'fallback',
+      target: 'system2',
       userMessageID: inspected.userMessageID,
       miss: s1,
       intent,

@@ -3,8 +3,8 @@
  *
  * ZERO footprint outside the `Tutor` model:
  * - Registers the `CUA Tutor` provider (`cua-tutor`) with ONE visible model (`cua-tutor/tutor`,
- *   displayed as "Tutor") and ONE hidden fallback model (`cua-tutor/fallback`, cloned from
- *   the required `config.fallbackModel`).
+ *   displayed as "Tutor") and ONE hidden System 2 model (`cua-tutor/system2`, cloned from
+ *   the required `config.system2Model`).
  * - Registers `tutor_set_app` and `tutor_highlight`, then strips BOTH from `event.tools` and
  *   injects zero guidance on every non-Tutor model via `session.hook("context")`.
  * - When `Tutor` IS selected:
@@ -12,18 +12,18 @@
  *      `Tutor.highlight` on visible UI requests when an app is already selected (served via
  *      `aisdk.hook("language")` with ZERO System-2 tokens).
  *   2. On conceptual questions, app setup/switching, web research, System-1 misses, or tool-loop
- *      continuations, `experimental.model.resolve` routes natively to `cua-tutor/fallback` for a
+ *      continuations, `experimental.model.resolve` routes natively to `cua-tutor/system2` for a
  *      full OpenCode agent loop (`tutor_set_app`, `tutor_highlight`, `websearch`, `webfetch`, etc.).
  *   3. `tutor_highlight` is hard-gated on `tutor_set_app` (session app must be set first), and
  *      `tutor_set_app` validates installed macOS `.app` bundles + auto-launches if closed.
  */
 import { Integration, Model, Plugin, Provider } from '@opencode/plugin';
 
-import { assertFallbackModelConfigured, loadConfig } from './config.js';
+import { assertSystem2ModelConfigured, loadConfig } from './config.js';
 import {
   buildTutorGuidance,
   decideTutorRoute,
-  DIRECT_FALLBACK_MODEL_ID,
+  DIRECT_SYSTEM2_MODEL_ID,
   DIRECT_MODEL_ID,
   DIRECT_MODEL_NAME,
   DIRECT_PROVIDER_ID,
@@ -76,13 +76,13 @@ export default Plugin.define({
   async setup(ctx) {
     const options = (ctx.options ?? {}) as Record<string, unknown>;
     const config = loadConfig(options);
-    if (config.directModel) assertFallbackModelConfigured(options);
+    if (config.directModel) assertSystem2ModelConfigured(options);
 
     const tutors = new Map<string, Tutor>();
     const sessionApps = new Map<string, string>();
     const tutorTurns = new Map<string, TutorTurnState>();
-    let hasFallbackModel = false;
-    let fallbackSource: { model: Model.Info; provider: Provider.Info } | undefined;
+    let hasSystem2Model = false;
+    let system2Source: { model: Model.Info; provider: Provider.Info } | undefined;
     let stopConfigEvents: (() => void) | undefined;
     let replyServer: ReplyServer | undefined;
 
@@ -99,8 +99,8 @@ export default Plugin.define({
 
     const providerID = Provider.ID.make(DIRECT_PROVIDER_ID);
     const tutorModelID = Model.ID.make(DIRECT_MODEL_ID);
-    const fallbackModelID = Model.ID.make(DIRECT_FALLBACK_MODEL_ID);
-    const fallbackRef = config.fallbackModel;
+    const system2ModelID = Model.ID.make(DIRECT_SYSTEM2_MODEL_ID);
+    const system2Ref = config.system2Model;
 
     // 1. Register `tutor_set_app` and `tutor_highlight` (strictly hidden on all non-Tutor models below)
     await ctx.tool.transform((editor) => {
@@ -121,7 +121,7 @@ export default Plugin.define({
           properties: {
             app: {
               type: 'string',
-              description: 'Exact macOS app name or bundle id the user wants to learn, e.g. "FilmCraft", "Keynote", or "Finder".',
+              description: 'Exact macOS app name or bundle id the user wants to learn, e.g. "FilmCraft", "Keynote", or "TextEdit".',
             },
           },
           required: ['app'],
@@ -197,7 +197,7 @@ export default Plugin.define({
       });
     });
 
-    // 2. Register `CUA Tutor` (`cua-tutor`) provider with visible `cua-tutor/tutor` + hidden `cua-tutor/fallback`
+    // 2. Register `CUA Tutor` (`cua-tutor`) provider with visible `cua-tutor/tutor` + hidden `cua-tutor/system2`
     if (config.directModel) {
       replyServer = startReplyServer({
         consumePendingText: (sessionID) => {
@@ -212,8 +212,8 @@ export default Plugin.define({
       const replyToken = replyServer.token;
 
       await ctx.provider.transform((editor) => {
-        const source = fallbackSource;
-        hasFallbackModel = Boolean(source);
+        const source = system2Source;
+        hasSystem2Model = Boolean(source);
 
         const baseTutor = Model.Info.default(providerID, tutorModelID);
         const tutorModel: Model.Info = {
@@ -238,9 +238,9 @@ export default Plugin.define({
           // The resolved model already carries merged provider/config settings, headers, and variants.
           models.push({
             ...source.model,
-            id: fallbackModelID,
+            id: system2ModelID,
             providerID,
-            name: `${source.model.name} (Tutor Fallback)`,
+            name: `${source.model.name} (Tutor System 2)`,
             enabled: false, // Hidden from picker; routed to internally via experimental.model.resolve
           });
         }
@@ -263,10 +263,10 @@ export default Plugin.define({
         });
       });
 
-      const loadFallback = async () => {
-        if (!fallbackRef) return;
+      const loadSystem2Model = async () => {
+        if (!system2Ref) return;
         const found = (await ctx.model.list()).data.find(
-          (m) => m.providerID === fallbackRef.providerID && m.id === fallbackRef.id
+          (m) => m.providerID === system2Ref.providerID && m.id === system2Ref.id
         );
         // The client returns the same records without branded ID types.
         const next = found
@@ -275,16 +275,16 @@ export default Plugin.define({
               provider: (await ctx.provider.get({ providerID: found.providerID })).data as unknown as Provider.Info,
             }
           : undefined;
-        if (JSON.stringify(next) === JSON.stringify(fallbackSource)) return;
-        fallbackSource = next;
+        if (JSON.stringify(next) === JSON.stringify(system2Source)) return;
+        system2Source = next;
         await ctx.provider.reload();
       };
       // Not awaited: the source provider (especially one defined in opencode.json(c)) may register after this plugin.
-      void loadFallback().catch(() => {});
+      void loadSystem2Model().catch(() => {});
       const configEvents = new AbortController();
       void (async () => {
         for await (const _ of ctx.event.subscribe({ types: ['config.updated'], signal: configEvents.signal })) {
-          await loadFallback().catch(() => {});
+          await loadSystem2Model().catch(() => {});
         }
       })().catch(() => {});
       stopConfigEvents = () => configEvents.abort();
@@ -335,7 +335,7 @@ export default Plugin.define({
         }
 
         const prevTurn = tutorTurns.get(event.sessionID);
-        if (!hasFallbackModel) await loadFallback().catch(() => {});
+        if (!hasSystem2Model) await loadSystem2Model().catch(() => {});
         let messages: readonly unknown[] = [];
         try {
           messages = await ctx.session.context({ sessionID: event.sessionID });
@@ -353,10 +353,10 @@ export default Plugin.define({
           },
           tutor: getTutor(event.sessionID),
           intentClassifier,
-          hasFallbackModel,
+          hasSystem2Model,
         });
 
-        if (decision.target === 'fallback' && hasFallbackModel) {
+        if (decision.target === 'system2' && hasSystem2Model) {
           tutorTurns.set(event.sessionID, {
             mode: 'system2',
             userMessageID: decision.userMessageID,
@@ -364,8 +364,8 @@ export default Plugin.define({
           });
           event.model = {
             providerID,
-            id: fallbackModelID,
-            ...(fallbackRef?.variant ? { variant: Model.VariantID.make(fallbackRef.variant) } : {}),
+            id: system2ModelID,
+            ...(system2Ref?.variant ? { variant: Model.VariantID.make(system2Ref.variant) } : {}),
           };
           return;
         }
@@ -373,7 +373,7 @@ export default Plugin.define({
         tutorTurns.set(event.sessionID, {
           mode: 'system1',
           userMessageID: decision.userMessageID,
-          pendingText: decision.target === 'system1' ? decision.text : 'System-2 fallback is unavailable.',
+          pendingText: decision.target === 'system1' ? decision.text : 'System 2 is unavailable.',
         });
       });
     }
@@ -381,7 +381,7 @@ export default Plugin.define({
     // 3. Strictly isolate Tutor tools & guidance to ONLY active Tutor System-2 turns
     await ctx.session.hook('context', (event) => {
       const isTutorSystem2 =
-        event.model.providerID === DIRECT_PROVIDER_ID && event.model.id === DIRECT_FALLBACK_MODEL_ID;
+        event.model.providerID === DIRECT_PROVIDER_ID && event.model.id === DIRECT_SYSTEM2_MODEL_ID;
       if (!isTutorSystem2) {
         delete event.tools.tutor_set_app;
         delete event.tools.tutor_highlight;

@@ -11,7 +11,7 @@ Inside **`Tutor`**:
   items), gliding the Cua Driver agent cursor directly to the control. **It never clicks. You click.**
 - **Full native System-2 agent loop:** On app setup/switching, conceptual questions, web research,
   or System-1 misses, `cua-tutor/tutor` routes seamlessly via `experimental.model.resolve` to a
-  hidden `cua-tutor/fallback` model (cloned from the model you set as `fallbackModel`) with full
+  hidden `cua-tutor/system2` model (cloned from the model you set as `system2Model`) with full
   OpenCode tool calling (`tutor_set_app`,
   `tutor_highlight`, `websearch`, `webfetch`, `read`, `question`, etc.).
 - **Explicit app selection + auto-launch:** No `ignoreApps` list and no guessing from open windows.
@@ -39,7 +39,7 @@ and the plugin looks there, so PATH doesn't matter.
 
 1. Install the plugin's dependencies once: `cd /path/to/opencode-cua-tutor && bun install`
 2. Add the plugin to your global OpenCode config, `~/.config/opencode/opencode.jsonc`, with a
-   `fallbackModel`. Keep the keys you already have:
+   `system2Model`. Keep the keys you already have:
 
    ```jsonc
    {
@@ -48,18 +48,18 @@ and the plugin looks there, so PATH doesn't matter.
        {
          "package": "/path/to/opencode-cua-tutor",
          "options": {
-           "fallbackModel": "opencode-go/glm-5.3-flash#high"
+           "system2Model": "opencode-go/glm-5.3-flash#high"
          }
        }
      ]
    }
    ```
 
-   `fallbackModel` is required and has no default. It is the model `Tutor` hands a turn to when
+   `system2Model` is required and has no default. It is the model `Tutor` hands a turn to when
    it can't just point at a control: setting up the app, conceptual questions, web research, and
    System-1 misses. Use any `provider/model` or `provider/model#variant` you can already use in
-   OpenCode, including providers defined in your own `opencode.json(c)`; the fallback uses that
-   provider's credentials. The `CUA_TUTOR_FALLBACK_MODEL` environment variable also works. Without
+   OpenCode, including providers defined in your own `opencode.json(c)`; the System 2 model uses that
+   provider's credentials. The `CUA_TUTOR_SYSTEM2_MODEL` environment variable also works. Without
    it, the plugin fails to load with an error naming the option. `"none"` runs `Tutor` without
    System 2 (it then only points, and can't call `tutor_set_app`, so pin `app` too).
 
@@ -68,11 +68,11 @@ and the plugin looks there, so PATH doesn't matter.
    server process has to see the variable. Without a key the tool reports unavailable.
    `provider: "mock"` explicitly enables a development-only word matcher; results identify it.
 
-## Direct Tutor Mode (`CUA Tutor → Tutor` — System 1 first, native System-2 agent loop on fallback)
+## Direct Tutor Mode (`CUA Tutor → Tutor` — System 1 first, native System-2 agent loop)
 
 The plugin registers the **`CUA Tutor`** provider (`cua-tutor`) with one visible model in OpenCode's
-picker (**`Tutor`**, `cua-tutor/tutor`) and one hidden fallback model (`cua-tutor/fallback`, cloned
-from your required **`fallbackModel`**):
+picker (**`Tutor`**, `cua-tutor/tutor`) and one hidden System 2 model (`cua-tutor/system2`, cloned
+from your required **`system2Model`**):
 
 1. Select **`CUA Tutor → Tutor`** in the model picker (works in Desktop, TUI, Web, and Mobile).
 2. Mention the app once at the start (e.g. *"I'm trying to learn FilmCraft today"*). System 2 calls
@@ -81,13 +81,13 @@ from your required **`fallbackModel`**):
    the rest of the session.
 3. **Jev Intent Gate (~90 ms, 4 parallel atomic `Noul`s, 0 screenshots):**
    - `explicit_do_for_me` → instant point-only notice (`0` LLM tokens, `0` screenshots).
-   - `is_conceptual_or_chat` (or no app set yet) → routes natively to `cua-tutor/fallback` for a
+   - `is_conceptual_or_chat` (or no app set yet) → routes natively to `cua-tutor/system2` for a
      full OpenCode tool-calling loop (`tutor_set_app`, `websearch`, `webfetch`, `read`, `question`, etc.).
    - `wants_ui_pointer` (once an app is set) → runs `CuaDriver + TypeSafe Jev` directly with
      **zero System-2 tokens** and points immediately.
 4. **Automatic System-2 escalation on UI miss:** If System 1 returns `reobserve`, `abstain`,
    `unsure`, or `partial` (e.g. a setting hidden behind an unopened tab/menu), it routes that turn
-   to `cua-tutor/fallback` with the System-1 miss diagnostics injected into context so System 2 can
+   to `cua-tutor/system2` with the System-1 miss diagnostics injected into context so System 2 can
    coach you, search docs, or call `tutor_highlight` on the visible prerequisite control.
 
 ## Tutor Tools (visible ONLY when `Tutor` is selected)
@@ -111,8 +111,8 @@ tutor_highlight({ step: string, visualCue?: string })
 
 | Mechanism | What |
 | --- | --- |
-| `ctx.provider.transform` | Registers `CUA Tutor` (`cua-tutor`) with visible `cua-tutor/tutor` and hidden `cua-tutor/fallback`, cloned from the fully resolved `fallbackModel` (`ctx.model.list()`), borrowing its provider's credentials |
-| `ctx.session.hook("experimental.model.resolve")` | Routes `cua-tutor/tutor` turns between System 1 (zero LLM tokens) and native `cua-tutor/fallback` (full OpenCode tool loop) |
+| `ctx.provider.transform` | Registers `CUA Tutor` (`cua-tutor`) with visible `cua-tutor/tutor` and hidden `cua-tutor/system2`, cloned from the fully resolved `system2Model` (`ctx.model.list()`), borrowing its provider's credentials |
+| `ctx.session.hook("experimental.model.resolve")` | Routes `cua-tutor/tutor` turns between System 1 (zero LLM tokens) and native `cua-tutor/system2` (full OpenCode tool loop) |
 | `ctx.tool.transform` + `ctx.session.hook("context")` | Exposes `tutor_set_app` and `tutor_highlight` + dynamic Tutor guidance **only** to `Tutor` sessions; strips both on every other model |
 | `ctx.mcp.transform` | Optional `cua-driver` MCP declaration (`declareMcp: false` by default so zero tools leak outside `Tutor`) |
 
@@ -195,7 +195,7 @@ back the same point.
   {
     "package": "/path/to/opencode-cua-tutor",
     "options": {
-      "fallbackModel": "opencode-go/glm-5.3-flash#high",
+      "system2Model": "opencode-go/glm-5.3-flash#high",
       "deadlineMs": 15000
     }
   }
@@ -208,7 +208,7 @@ back the same point.
 | `provider` (`live`/`mock`) | `CUA_TUTOR_PROVIDER` | `live`; mock must be explicit; typos are errors |
 | `jevModel` | `CUA_TUTOR_JEV_MODEL` | SDK default |
 | `directModel` | `CUA_TUTOR_DIRECT_MODEL` | `true` (register the `CUA Tutor → Tutor` router model) |
-| `fallbackModel` | `CUA_TUTOR_FALLBACK_MODEL` | **Required, no default** while `directModel` is on. Any `provider/model#variant`, including providers defined in `opencode.json(c)`; cloned as hidden `cua-tutor/fallback`; `"none"` / `false` explicitly disables System 2 |
+| `system2Model` | `CUA_TUTOR_SYSTEM2_MODEL` | **Required, no default** while `directModel` is on. Any `provider/model#variant`, including providers defined in `opencode.json(c)`; cloned as hidden `cua-tutor/system2`; `"none"` / `false` explicitly disables System 2 |
 | `autoLaunch` | `CUA_TUTOR_AUTO_LAUNCH` | `true` (automatically launch verified installed macOS `.app` bundles when selected & closed) |
 | `visual` | `CUA_TUTOR_VISUAL` | `true` (enable Coarse-to-Fine `Box` visual fallback) |
 | `boxModel` | `CUA_TUTOR_BOX_MODEL` | `jev-1.14.0` (model for visual `Box` + tile/verify `Noul` calls) |

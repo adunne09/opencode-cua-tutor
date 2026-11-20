@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { gunzipSync, zstdDecompressSync } from 'node:zlib';
 
-import { assertFallbackModelConfigured, formatModelRef, loadConfig, parseModelRef } from '../src/config.js';
+import { assertSystem2ModelConfigured, formatModelRef, loadConfig, parseModelRef } from '../src/config.js';
 import {
   buildTutorGuidance,
   decideTutorRoute,
@@ -47,26 +47,26 @@ function fakeResult(overrides: Partial<HighlightResult> = {}): HighlightResult {
 }
 
 describe('Direct Tutor config and message inspection', () => {
-  test('defaults directModel=true, autoLaunch=true, declareMcp=false, and requires an explicit fallbackModel', () => {
+  test('defaults directModel=true, autoLaunch=true, declareMcp=false, and requires an explicit system2Model', () => {
     const def = loadConfig({}, {});
     expect(def.directModel).toBe(true);
     expect(def.autoLaunch).toBe(true);
     expect(def.declareMcp).toBe(false);
-    expect(def.fallbackModel).toBeUndefined();
-    expect(() => assertFallbackModelConfigured({}, {})).toThrow(/fallbackModel/);
-    expect(() => assertFallbackModelConfigured({ fallbackModel: 'opencode-go/glm-5.3-flash#high' }, {})).not.toThrow();
-    expect(() => assertFallbackModelConfigured({}, { CUA_TUTOR_FALLBACK_MODEL: 'opencode-go/glm-5.3-flash' })).not.toThrow();
-    expect(() => assertFallbackModelConfigured({ fallbackModel: 'none' }, {})).not.toThrow();
-    expect(() => assertFallbackModelConfigured({ fallbackModel: false }, {})).not.toThrow();
+    expect(def.system2Model).toBeUndefined();
+    expect(() => assertSystem2ModelConfigured({}, {})).toThrow(/system2Model/);
+    expect(() => assertSystem2ModelConfigured({ system2Model: 'opencode-go/glm-5.3-flash#high' }, {})).not.toThrow();
+    expect(() => assertSystem2ModelConfigured({}, { CUA_TUTOR_SYSTEM2_MODEL: 'opencode-go/glm-5.3-flash' })).not.toThrow();
+    expect(() => assertSystem2ModelConfigured({ system2Model: 'none' }, {})).not.toThrow();
+    expect(() => assertSystem2ModelConfigured({ system2Model: false }, {})).not.toThrow();
 
-    const configured = loadConfig({ fallbackModel: 'accomplish/zai-org/GLM-5.3-Flash#high' }, {});
-    expect(configured.fallbackModel).toEqual({ providerID: 'accomplish', id: 'zai-org/GLM-5.3-Flash', variant: 'high' });
-    expect(formatModelRef(configured.fallbackModel!)).toBe('accomplish/zai-org/GLM-5.3-Flash#high');
+    const configured = loadConfig({ system2Model: 'accomplish/zai-org/GLM-5.3-Flash#high' }, {});
+    expect(configured.system2Model).toEqual({ providerID: 'accomplish', id: 'zai-org/GLM-5.3-Flash', variant: 'high' });
+    expect(formatModelRef(configured.system2Model!)).toBe('accomplish/zai-org/GLM-5.3-Flash#high');
 
     expect(loadConfig({ directModel: false }, {}).directModel).toBe(false);
     expect(loadConfig({ autoLaunch: false }, {}).autoLaunch).toBe(false);
-    expect(loadConfig({ fallbackModel: 'none' }, {}).fallbackModel).toBeUndefined();
-    expect(loadConfig({ fallbackModel: false }, {}).fallbackModel).toBeUndefined();
+    expect(loadConfig({ system2Model: 'none' }, {}).system2Model).toBeUndefined();
+    expect(loadConfig({ system2Model: false }, {}).system2Model).toBeUndefined();
     expect(parseModelRef('anthropic/claude-sonnet-5-5#low')).toEqual({
       providerID: 'anthropic',
       id: 'claude-sonnet-5-5',
@@ -116,7 +116,7 @@ describe('Direct Tutor System-1 / System-2 Router (`decideTutorRoute`)', () => {
       messages: [{ type: 'user', id: 'u1', text: 'switch to razor tool' }],
       tutor,
       sessionApp: 'FilmCraft',
-      hasFallbackModel: true,
+      hasSystem2Model: true,
     });
     expect(res.target).toBe('system1');
     if (res.target === 'system1') {
@@ -127,7 +127,7 @@ describe('Direct Tutor System-1 / System-2 Router (`decideTutorRoute`)', () => {
     expect(calls).toEqual([{ step: 'switch to razor tool', app: 'FilmCraft', visualCue: undefined }]);
   });
 
-  test('System-1 miss routes natively to fallback with miss diagnostics for buildTutorGuidance', async () => {
+  test('System-1 miss routes natively to System 2 with miss diagnostics for buildTutorGuidance', async () => {
     const tutor: DirectTutorLike = {
       async highlight() {
         return fakeResult({
@@ -150,11 +150,11 @@ describe('Direct Tutor System-1 / System-2 Router (`decideTutorRoute`)', () => {
       messages: [{ type: 'user', id: 'u2', text: 'change the export codec to ProRes' }],
       tutor,
       sessionApp: 'FilmCraft',
-      hasFallbackModel: true,
+      hasSystem2Model: true,
     });
 
-    expect(res.target).toBe('fallback');
-    if (res.target === 'fallback') {
+    expect(res.target).toBe('system2');
+    if (res.target === 'system2') {
       expect(res.miss?.decision).toBe('reobserve');
       const guidance = buildTutorGuidance({ sessionApp: 'FilmCraft', autoLaunch: true, miss: res.miss });
       expect(guidance).toContain('is_hidden_subcontrol=0.91');
@@ -163,7 +163,7 @@ describe('Direct Tutor System-1 / System-2 Router (`decideTutorRoute`)', () => {
     }
   });
 
-  test('tool-loop continuation routes straight to fallback in 0ms without re-running Jev or System 1', async () => {
+  test('tool-loop continuation routes straight to System 2 in 0ms without re-running Jev or System 1', async () => {
     let gateCalls = 0;
     let highlightCalls = 0;
     const res = await decideTutorRoute({
@@ -181,9 +181,9 @@ describe('Direct Tutor System-1 / System-2 Router (`decideTutorRoute`)', () => {
         gateCalls++;
         return { wantsUiPointer: 0, isConceptualOrChat: 1, explicitDoForMe: 0, switchesApp: 0, latencyMs: 10 };
       },
-      hasFallbackModel: true,
+      hasSystem2Model: true,
     });
-    expect(res.target).toBe('fallback');
+    expect(res.target).toBe('system2');
     expect(gateCalls).toBe(0);
     expect(highlightCalls).toBe(0);
   });
@@ -226,9 +226,9 @@ describe('Direct Tutor System-1 / System-2 Router (`decideTutorRoute`)', () => {
       sessionApp: remembered,
       onSessionApp: (a) => { remembered = a; },
       intentClassifier,
-      hasFallbackModel: true,
+      hasSystem2Model: true,
     });
-    expect(t1.target).toBe('fallback');
+    expect(t1.target).toBe('system2');
     expect(highlightCalls).toHaveLength(0);
 
     // Simulate System 2 calling `tutor_set_app({ app: "FilmCraft" })`
@@ -241,7 +241,7 @@ describe('Direct Tutor System-1 / System-2 Router (`decideTutorRoute`)', () => {
       sessionApp: remembered,
       onSessionApp: (a) => { remembered = a; },
       intentClassifier,
-      hasFallbackModel: true,
+      hasSystem2Model: true,
     });
     expect(t2.target).toBe('system1');
     if (t2.target === 'system1') expect(t2.pointed).toBe(true);
@@ -254,9 +254,9 @@ describe('Direct Tutor System-1 / System-2 Router (`decideTutorRoute`)', () => {
       sessionApp: remembered,
       onSessionApp: (a) => { remembered = a; },
       intentClassifier,
-      hasFallbackModel: true,
+      hasSystem2Model: true,
     });
-    expect(t3.target).toBe('fallback');
+    expect(t3.target).toBe('system2');
     expect(highlightCalls).toHaveLength(1);
 
     // Turn 4: Explicit delegation ("for me") -> instant point-only notice, ZERO System 2
@@ -266,7 +266,7 @@ describe('Direct Tutor System-1 / System-2 Router (`decideTutorRoute`)', () => {
       sessionApp: remembered,
       onSessionApp: (a) => { remembered = a; },
       intentClassifier,
-      hasFallbackModel: true,
+      hasSystem2Model: true,
     });
     expect(t4.target).toBe('system1');
     if (t4.target === 'system1') expect(t4.route).toBe('delegation');
@@ -279,14 +279,14 @@ describe('Direct Tutor System-1 / System-2 Router (`decideTutorRoute`)', () => {
       sessionApp: remembered,
       onSessionApp: (a) => { remembered = a; },
       intentClassifier,
-      hasFallbackModel: true,
+      hasSystem2Model: true,
     });
     expect(t5.target).toBe('system1');
     expect(remembered).toBe('Keynote');
     expect(highlightCalls.at(-1)).toEqual({ step: 'in Keynote, add a new slide', app: 'Keynote' });
   });
 
-  test('when sessionApp is unset and user gives a generic UI step, routes to System 2 (or asks when fallback disabled) and NEVER calls highlight', async () => {
+  test('when sessionApp is unset and user gives a generic UI step, routes to System 2 (or asks when System 2 is disabled) and NEVER calls highlight', async () => {
     let highlightCalls = 0;
     const tutor: DirectTutorLike = {
       async highlight() {
@@ -298,25 +298,25 @@ describe('Direct Tutor System-1 / System-2 Router (`decideTutorRoute`)', () => {
       },
     };
 
-    const withFallback = await decideTutorRoute({
+    const withSystem2 = await decideTutorRoute({
       messages: [{ type: 'user', id: 'u1', text: 'switch to the razor tool' }],
       tutor,
       sessionApp: undefined,
-      hasFallbackModel: true,
+      hasSystem2Model: true,
     });
-    expect(withFallback.target).toBe('fallback');
+    expect(withSystem2.target).toBe('system2');
     expect(highlightCalls).toBe(0);
 
-    const noFallback = await decideTutorRoute({
+    const noSystem2 = await decideTutorRoute({
       messages: [{ type: 'user', id: 'u1', text: 'switch to the razor tool' }],
       tutor,
       sessionApp: undefined,
-      hasFallbackModel: false,
+      hasSystem2Model: false,
     });
-    expect(noFallback.target).toBe('system1');
-    if (noFallback.target === 'system1') {
-      expect(noFallback.route).toBe('no_app');
-      expect(noFallback.text).toMatch(/No app is selected/i);
+    expect(noSystem2.target).toBe('system1');
+    if (noSystem2.target === 'system1') {
+      expect(noSystem2.route).toBe('no_app');
+      expect(noSystem2.text).toMatch(/No app is selected/i);
     }
     expect(highlightCalls).toBe(0);
   });

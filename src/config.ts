@@ -72,8 +72,8 @@ export type TutorConfig = {
   locateModel: string;
   /** Register the direct System-1 virtual model `Tutor` (`cua-tutor/tutor`) in OpenCode's model picker. */
   directModel: boolean;
-  /** System-2 model invoked when `Tutor` routes to System 2 (conceptual, setup, or System-1 miss). No default; see `assertFallbackModelConfigured`. */
-  fallbackModel?: ModelRef;
+  /** System-2 model invoked when `Tutor` routes to System 2 (conceptual, setup, or System-1 miss). No default; see `assertSystem2ModelConfigured`. */
+  system2Model?: ModelRef;
   /** Automatically launch an installed macOS `.app` bundle when the selected app is not open yet. */
   autoLaunch: boolean;
   /** Inject dynamic tutor guidance into `Tutor` System-2 turns. */
@@ -97,10 +97,10 @@ export function resolveDriverBinary(explicit: unknown, home = homedir()): string
 }
 
 /** The `Tutor` router has no built-in System-2 model, so the plugin must be told which one to use. */
-export function assertFallbackModelConfigured(options: Record<string, unknown> = {}, env: NodeJS.ProcessEnv = process.env) {
-  if ((options.fallbackModel ?? env.CUA_TUTOR_FALLBACK_MODEL) !== undefined) return;
+export function assertSystem2ModelConfigured(options: Record<string, unknown> = {}, env: NodeJS.ProcessEnv = process.env) {
+  if ((options.system2Model ?? env.CUA_TUTOR_SYSTEM2_MODEL) !== undefined) return;
   throw new Error(
-    'CUA Tutor requires the `fallbackModel` plugin option (or CUA_TUTOR_FALLBACK_MODEL), e.g. "opencode-go/glm-5.3-flash#high". ' +
+    'CUA Tutor requires the `system2Model` plugin option (or CUA_TUTOR_SYSTEM2_MODEL), e.g. "opencode-go/glm-5.3-flash#high". ' +
       'Use "none" to run without System 2, or set `directModel: false` to skip the Tutor model.'
   );
 }
@@ -134,7 +134,7 @@ export function loadConfig(options: Record<string, unknown> = {}, env: NodeJS.Pr
     locate: !['0', 'false', 'off'].includes(String(pick('locate', 'CUA_TUTOR_LOCATE') ?? 'false').toLowerCase()),
     locateModel: String(pick('locateModel', 'CUA_TUTOR_LOCATE_MODEL') ?? 'jev-1.14.0'),
     directModel: !['0', 'false', 'off'].includes(String(pick('directModel', 'CUA_TUTOR_DIRECT_MODEL') ?? 'true').toLowerCase()),
-    fallbackModel: parseModelRef(pick('fallbackModel', 'CUA_TUTOR_FALLBACK_MODEL')),
+    system2Model: parseModelRef(pick('system2Model', 'CUA_TUTOR_SYSTEM2_MODEL')),
     autoLaunch: !['0', 'false', 'off'].includes(String(pick('autoLaunch', 'CUA_TUTOR_AUTO_LAUNCH') ?? 'true').toLowerCase()),
     injectGuidance: options.injectGuidance !== false,
     declareMcp: options.declareMcp === true,
