@@ -96,7 +96,7 @@ tutor_highlight({ step: string, visualCue?: string })
 
 | Mechanism | What |
 | --- | --- |
-| `ctx.provider.transform` | Registers `CUA Tutor` (`cua-tutor`) with visible `cua-tutor/tutor` and hidden `cua-tutor/fallback` (cloned from `fallbackModel`) |
+| `ctx.provider.transform` | Registers `CUA Tutor` (`cua-tutor`) with visible `cua-tutor/tutor` and hidden `cua-tutor/fallback`, cloned from the fully resolved `fallbackModel` (`ctx.model.list()`), borrowing its provider's credentials |
 | `ctx.session.hook("experimental.model.resolve")` | Routes `cua-tutor/tutor` turns between System 1 (zero LLM tokens) and native `cua-tutor/fallback` (full OpenCode tool loop) |
 | `ctx.tool.transform` + `ctx.session.hook("context")` | Exposes `tutor_set_app` and `tutor_highlight` + dynamic Tutor guidance **only** to `Tutor` sessions; strips both on every other model |
 | `ctx.mcp.transform` | Optional `cua-driver` MCP declaration (`declareMcp: false` by default so zero tools leak outside `Tutor`) |
@@ -192,7 +192,7 @@ back the same point.
 | `provider` (`live`/`mock`) | `CUA_TUTOR_PROVIDER` | `live`; mock must be explicit; typos are errors |
 | `jevModel` | `CUA_TUTOR_JEV_MODEL` | SDK default |
 | `directModel` | `CUA_TUTOR_DIRECT_MODEL` | `true` (register the `CUA Tutor → Tutor` router model) |
-| `fallbackModel` | `CUA_TUTOR_FALLBACK_MODEL` | `opencode-go/glm-5.3-flash#high` (cloned as hidden `cua-tutor/fallback`; `"none"` / `false` disables) |
+| `fallbackModel` | `CUA_TUTOR_FALLBACK_MODEL` | `opencode-go/glm-5.3-flash#high` (any `provider/model#variant`, including providers defined in `opencode.json(c)`; cloned as hidden `cua-tutor/fallback`; `"none"` / `false` disables) |
 | `autoLaunch` | `CUA_TUTOR_AUTO_LAUNCH` | `true` (automatically launch verified installed macOS `.app` bundles when selected & closed) |
 | `visual` | `CUA_TUTOR_VISUAL` | `true` (enable Coarse-to-Fine `Box` visual fallback) |
 | `boxModel` | `CUA_TUTOR_BOX_MODEL` | `jev-1.14.0` (model for visual `Box` + tile/verify `Noul` calls) |

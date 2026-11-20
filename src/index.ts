@@ -17,7 +17,7 @@
  *   3. `tutor_highlight` is hard-gated on `tutor_set_app` (session app must be set first), and
  *      `tutor_set_app` validates installed macOS `.app` bundles + auto-launches if closed.
  */
-import { Model, Plugin, Provider } from '@opencode/plugin';
+import { Integration, Model, Plugin, Provider } from '@opencode/plugin';
 
 import { loadConfig } from './config.js';
 import {
@@ -81,6 +81,8 @@ export default Plugin.define({
     const sessionApps = new Map<string, string>();
     const tutorTurns = new Map<string, TutorTurnState>();
     let hasFallbackModel = false;
+    let fallbackSource: { model: Model.Info; provider: Provider.Info } | undefined;
+    let stopConfigEvents: (() => void) | undefined;
     let replyServer: ReplyServer | undefined;
 
     const getTutor = (sessionID: string) => {
@@ -209,9 +211,8 @@ export default Plugin.define({
       const replyToken = replyServer.token;
 
       await ctx.provider.transform((editor) => {
-        const source = fallbackRef ? editor.get(fallbackRef.providerID) : undefined;
-        const sourceModel = source && fallbackRef ? source.models.get(fallbackRef.id) : undefined;
-        hasFallbackModel = Boolean(source && sourceModel);
+        const source = fallbackSource;
+        hasFallbackModel = Boolean(source);
 
         const baseTutor = Model.Info.default(providerID, tutorModelID);
         const tutorModel: Model.Info = {
@@ -221,10 +222,10 @@ export default Plugin.define({
           package: '@opencode/ai/providers/openai-compatible',
           settings: { baseURL: replyBaseURL, apiKey: false },
           headers: { 'x-tutor-token': replyToken },
-          ...(sourceModel
+          ...(source
             ? {
-                limit: sourceModel.limit,
-                capabilities: { ...sourceModel.capabilities, tools: true },
+                limit: source.model.limit,
+                capabilities: { ...source.model.capabilities, tools: true },
               }
             : {
                 capabilities: { ...baseTutor.capabilities, tools: false, input: ['text'], output: ['text'] },
@@ -232,40 +233,60 @@ export default Plugin.define({
         };
 
         const models: Model.Info[] = [tutorModel];
-        if (source && sourceModel) {
+        if (source) {
+          // The resolved model already carries merged provider/config settings, headers, and variants.
           models.push({
-            ...sourceModel,
+            ...source.model,
             id: fallbackModelID,
             providerID,
-            package: sourceModel.package ?? source.provider.package,
-            name: `${sourceModel.name} (Tutor Fallback)`,
+            name: `${source.model.name} (Tutor Fallback)`,
             enabled: false, // Hidden from picker; routed to internally via experimental.model.resolve
           });
         }
 
-        const providerInfo: Provider.Info = source
-          ? {
-              ...source.provider,
-              id: providerID,
-              canonical: source.provider.canonical ?? source.provider.id,
-              name: 'CUA Tutor',
-              activation: 'enabled',
-            }
-          : {
-              ...Provider.Info.empty(providerID),
-              name: 'CUA Tutor',
-              activation: 'enabled',
-              package: '@opencode/ai/providers/openai-compatible',
-              settings: { baseURL: replyBaseURL, apiKey: false },
-              headers: { 'x-tutor-token': replyToken },
-            };
-
         editor.add({
-          info: providerInfo,
+          info: {
+            ...Provider.Info.empty(providerID),
+            name: 'CUA Tutor',
+            activation: 'enabled',
+            package: '@opencode/ai/providers/openai-compatible',
+            // Borrow the source provider's identity so its stored, env, or OAuth credentials resolve.
+            ...(source
+              ? {
+                  integrationID: source.provider.integrationID ?? Integration.ID.make(source.provider.id),
+                  canonical: source.provider.canonical ?? source.provider.id,
+                }
+              : {}),
+          },
           models,
-          ...(source?.sourceConnection ? { sourceConnection: source.sourceConnection } : {}),
         });
       });
+
+      const loadFallback = async () => {
+        if (!fallbackRef) return;
+        const found = (await ctx.model.list()).data.find(
+          (m) => m.providerID === fallbackRef.providerID && m.id === fallbackRef.id
+        );
+        // The client returns the same records without branded ID types.
+        const next = found
+          ? {
+              model: found as unknown as Model.Info,
+              provider: (await ctx.provider.get({ providerID: found.providerID })).data as unknown as Provider.Info,
+            }
+          : undefined;
+        if (JSON.stringify(next) === JSON.stringify(fallbackSource)) return;
+        fallbackSource = next;
+        await ctx.provider.reload();
+      };
+      // Not awaited: the source provider (especially one defined in opencode.json(c)) may register after this plugin.
+      void loadFallback().catch(() => {});
+      const configEvents = new AbortController();
+      void (async () => {
+        for await (const _ of ctx.event.subscribe({ types: ['config.updated'], signal: configEvents.signal })) {
+          await loadFallback().catch(() => {});
+        }
+      })().catch(() => {});
+      stopConfigEvents = () => configEvents.abort();
 
       await ctx.session.hook(
         'model.request',
@@ -313,6 +334,7 @@ export default Plugin.define({
         }
 
         const prevTurn = tutorTurns.get(event.sessionID);
+        if (!hasFallbackModel) await loadFallback().catch(() => {});
         let messages: readonly unknown[] = [];
         try {
           messages = await ctx.session.context({ sessionID: event.sessionID });
@@ -388,6 +410,7 @@ export default Plugin.define({
     }
 
     return async () => {
+      stopConfigEvents?.();
       replyServer?.close();
       await Promise.all([...tutors.values()].map((tutor) => tutor.close()));
       tutors.clear();
