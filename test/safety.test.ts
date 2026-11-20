@@ -456,6 +456,17 @@ describe('driver ownership and process lifetime', () => {
       await expect(driver.findWindow('NoSuchApp')).rejects.toBeInstanceOf(NoWindowError);
     } finally { await driver.close(); }
   });
+  test('a driver that exits on start reports its exit code and stderr', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'tutor-exit-'));
+    const driver = new CuaDriver(join(import.meta.dir, 'fake-cua-driver.ts'), 'exit', {
+      ...driverEnvironment(), FAKE_DRIVER_LOG: join(dir, 'calls'), FAKE_DRIVER_EXIT_ON_START: 'daemon refused the lease',
+    });
+    try {
+      const error = await driver.findWindow('Notes').catch((e) => e);
+      expect(error).not.toBeInstanceOf(NoWindowError);
+      expect(String(error)).toMatch(/cua-driver exited with code 3; stderr: daemon refused the lease/);
+    } finally { await driver.close(); }
+  });
   test('close during connection cleans its in-flight process', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'tutor-close-'));
     const pidLog = join(dir, 'pids');

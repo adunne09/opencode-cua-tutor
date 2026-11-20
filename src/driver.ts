@@ -9,6 +9,7 @@
  */
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import type { ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 
 const ALLOWED_TOOLS = new Set([
@@ -44,6 +45,21 @@ export class NoWindowError extends Error {
   }
 }
 
+const STDERR_TAIL_CHARS = 2000;
+
+type DriverProcess = {
+  stderr: string;
+  exit?: { code: number | null; signal: NodeJS.Signals | null };
+};
+
+/** Append how the driver process ended (exit code, signal, stderr tail) to an error, when it has ended. */
+function withProcessDetails(error: unknown, proc: DriverProcess | undefined): unknown {
+  if (!proc?.exit || !(error instanceof Error)) return error;
+  const how = proc.exit.signal ? `was killed by ${proc.exit.signal}` : `exited with code ${proc.exit.code}`;
+  const stderr = proc.stderr.trim().split('\n').slice(-5).join(' | ');
+  return new Error(`${error.message} (cua-driver ${how}${stderr ? `; stderr: ${stderr}` : '; no stderr output'})`, { cause: error });
+}
+
 /** The driver needs OS discovery/config, not the parent's unrelated provider credentials. */
 export function driverEnvironment(env: NodeJS.ProcessEnv = process.env): Record<string, string> {
   return Object.fromEntries(Object.entries(env).filter(([key, value]) =>
@@ -59,6 +75,8 @@ export class CuaDriver {
   private started = false;
   private sessionTouched = false;
   private starting?: Promise<void>;
+  /** The most recently spawned driver process. */
+  private proc?: DriverProcess;
   readonly session: string;
   /** Every Cua Driver tool this wrapper has sent, in order (for audits and the debug CLI). */
   readonly history: string[] = [];
@@ -79,7 +97,8 @@ export class CuaDriver {
     if (!this.connecting) {
       this.connecting = (async () => {
         const client = new Client({ name: 'opencode-cua-tutor', version: '0.2.0' });
-        const transport = new StdioClientTransport({ command: this.binary, args: ['mcp'], env: this.env });
+        const transport = new StdioClientTransport({ command: this.binary, args: ['mcp'], env: this.env, stderr: 'pipe' });
+        const proc = this.watchProcess(transport);
         // If the driver process exits, drop the dead client so the next call respawns it.
         client.onclose = () => {
           if (this.client !== client) return;
@@ -94,13 +113,32 @@ export class CuaDriver {
         } catch (error) {
           await client.close().catch(() => {});
           await transport.close().catch(() => {});
-          throw error;
+          throw withProcessDetails(error, proc);
         } finally {
           this.connecting = undefined;
         }
       })();
     }
     return this.connecting;
+  }
+
+  /** Keep the tail of the driver's stderr and how it exited, so connection errors can say why. */
+  private watchProcess(transport: StdioClientTransport): DriverProcess {
+    const proc: DriverProcess = { stderr: '' };
+    this.proc = proc;
+    transport.stderr?.on('data', (chunk: Buffer) => {
+      proc.stderr = (proc.stderr + chunk.toString()).slice(-STDERR_TAIL_CHARS);
+    });
+    const start = transport.start.bind(transport);
+    transport.start = async () => {
+      await start();
+      // The SDK drops the exit code, so listen on its child process directly.
+      const child = (transport as unknown as { _process?: ChildProcess })._process;
+      child?.once('exit', (code, signal) => {
+        proc.exit = { code, signal };
+      });
+    };
+    return proc;
   }
 
   async call(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<Record<string, unknown>> {
@@ -126,7 +164,9 @@ export class CuaDriver {
     signal?.throwIfAborted();
     this.history.push(name);
     if (name === 'get_window_state' && args.include_screenshot !== false) this.screenshotRequests++;
-    const result = (await client.callTool({ name, arguments: args }, undefined, { signal, timeout: 5000 })) as {
+    const result = (await client.callTool({ name, arguments: args }, undefined, { signal, timeout: 5000 }).catch((error) => {
+      throw withProcessDetails(error, this.proc);
+    })) as {
       isError?: boolean;
       structuredContent?: Record<string, unknown>;
       content?: { type: string; text?: string; data?: string }[];

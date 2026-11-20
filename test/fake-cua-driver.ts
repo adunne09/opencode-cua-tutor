@@ -15,6 +15,10 @@ import { z } from 'zod';
 
 const log = process.env.FAKE_DRIVER_LOG!;
 if (process.env.FAKE_DRIVER_PID_LOG) appendFileSync(process.env.FAKE_DRIVER_PID_LOG, `${process.pid}\n`);
+if (process.env.FAKE_DRIVER_EXIT_ON_START) {
+  process.stderr.write(`${process.env.FAKE_DRIVER_EXIT_ON_START}\n`);
+  process.exit(3);
+}
 const active = process.env.FAKE_ACTIVE_APP ?? 'Ghostty';
 const server = new McpServer({ name: 'fake-cua-driver', version: '0' });
 const record = (name: string, args: unknown) => appendFileSync(log, JSON.stringify({ name, args }) + '\n');
