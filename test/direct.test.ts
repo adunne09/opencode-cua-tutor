@@ -3,13 +3,13 @@ import { gunzipSync, zstdDecompressSync } from 'node:zlib';
 
 import { DEFAULT_FALLBACK_MODEL, formatModelRef, loadConfig, parseModelRef } from '../src/config.js';
 import {
-  extractLastUserText,
-  handleDirectTurn,
+  buildTutorGuidance,
+  decideTutorRoute,
+  inspectSessionMessages,
   makeDirectTitle,
   parseDirectInput,
-  parseFallbackJson,
   shouldEscalateToSystem2,
-  startDirectServer,
+  startReplyServer,
   type DirectTutorLike,
 } from '../src/direct.js';
 import { liveIntentClassifier, type IntentSignals } from '../src/jev.js';
@@ -46,14 +46,17 @@ function fakeResult(overrides: Partial<HighlightResult> = {}): HighlightResult {
   };
 }
 
-describe('Direct Tutor config and parsing', () => {
-  test('defaults directModel=true and fallbackModel=opencode-go/glm-5.3-flash#high, and allows overrides/disable', () => {
+describe('Direct Tutor config and message inspection', () => {
+  test('defaults directModel=true, autoLaunch=true, declareMcp=false, and fallbackModel=opencode-go/glm-5.3-flash#high', () => {
     const def = loadConfig({}, {});
     expect(def.directModel).toBe(true);
+    expect(def.autoLaunch).toBe(true);
+    expect(def.declareMcp).toBe(false);
     expect(def.fallbackModel).toEqual({ providerID: 'opencode-go', id: 'glm-5.3-flash', variant: 'high' });
     expect(formatModelRef(def.fallbackModel!)).toBe(DEFAULT_FALLBACK_MODEL);
 
     expect(loadConfig({ directModel: false }, {}).directModel).toBe(false);
+    expect(loadConfig({ autoLaunch: false }, {}).autoLaunch).toBe(false);
     expect(loadConfig({ fallbackModel: 'none' }, {}).fallbackModel).toBeUndefined();
     expect(loadConfig({ fallbackModel: false }, {}).fallbackModel).toBeUndefined();
     expect(parseModelRef('anthropic/claude-sonnet-5-5#low')).toEqual({
@@ -64,7 +67,7 @@ describe('Direct Tutor config and parsing', () => {
     expect(() => parseModelRef('no-slash')).toThrow();
   });
 
-  test('parseDirectInput, extractLastUserText, and makeDirectTitle strip system reminders and parse @App', () => {
+  test('parseDirectInput, inspectSessionMessages, and makeDirectTitle handle OpenCode V2 and OpenAI messages', () => {
     expect(parseDirectInput('mute audio track 1')).toEqual({ step: 'mute audio track 1' });
     expect(parseDirectInput('@FilmCraft switch to razor tool')).toEqual({
       app: 'FilmCraft',
@@ -75,40 +78,25 @@ describe('Direct Tutor config and parsing', () => {
       step: 'start screen recording',
     });
 
-    const userText = extractLastUserText([
-      { role: 'system', content: 'sys' },
-      { role: 'user', content: 'earlier' },
-      {
-        role: 'user',
-        content: [
-          { type: 'text', text: '<system-reminder>ignore me</system-reminder>\nlock video track 1' },
-        ],
-      },
+    // OpenCode V2 SessionMessage.Info format (ignoring model-switched / idle markers)
+    const fresh = inspectSessionMessages([
+      { type: 'user', id: 'msg_1', text: '<system-reminder>ignore</system-reminder>\nlock video track 1' },
+      { type: 'model-switched', id: 'msg_2' },
     ]);
-    expect(userText).toBe('lock video track 1');
-    expect(makeDirectTitle('@FilmCraft switch to the razor tool')).toBe('FilmCraft: switch to the razor tool');
-  });
+    expect(fresh).toEqual({ isContinuation: false, userMessageID: 'msg_1', userText: 'lock video track 1' });
 
-  test('parseFallbackJson handles raw JSON, fenced JSON, and plain prose', () => {
-    expect(
-      parseFallbackJson(
-        '```json\n{"reply":"Click Export first.","next_step":"switch to Export workspace","visual_cue":"Export tab top-left","app":null}\n```'
-      )
-    ).toEqual({
-      reply: 'Click Export first.',
-      nextStep: 'switch to Export workspace',
-      visualCue: 'Export tab top-left',
-      app: undefined,
-    });
-    expect(parseFallbackJson('A J-cut lets the next clip audio start early.')).toEqual({
-      reply: 'A J-cut lets the next clip audio start early.',
-    });
+    const cont = inspectSessionMessages([
+      { type: 'user', id: 'msg_1', text: 'I want to learn FilmCraft' },
+      { type: 'assistant', id: 'msg_2', content: [{ type: 'tool', name: 'tutor_set_app' }] },
+    ]);
+    expect(cont.isContinuation).toBe(true);
+
+    expect(makeDirectTitle('@FilmCraft switch to the razor tool')).toBe('FilmCraft: switch to the razor tool');
   });
 });
 
-describe('Direct Tutor System-1-first + System-2 fallback orchestration', () => {
-  test('System-1 hit returns immediately with ZERO System-2 calls', async () => {
-    let fallbackCalls = 0;
+describe('Direct Tutor System-1 / System-2 Router (`decideTutorRoute`)', () => {
+  test('System-1 hit returns immediately with ZERO System-2 routing', async () => {
     const calls: unknown[] = [];
     const tutor: DirectTutorLike = {
       async highlight(step, app, _sig, visualCue) {
@@ -116,122 +104,91 @@ describe('Direct Tutor System-1-first + System-2 fallback orchestration', () => 
         return fakeResult();
       },
     };
-    const res = await handleDirectTurn({
-      rawUserText: 'switch to razor tool',
-      history: [{ role: 'user', text: 'switch to razor tool' }],
+    const res = await decideTutorRoute({
+      messages: [{ type: 'user', id: 'u1', text: 'switch to razor tool' }],
       tutor,
-      fallback: async () => {
-        fallbackCalls++;
-        return '{"reply":"never"}';
-      },
-      fallbackModel: parseModelRef(DEFAULT_FALLBACK_MODEL),
+      sessionApp: 'FilmCraft',
+      hasFallbackModel: true,
     });
-    expect(res.escalated).toBe(false);
-    expect(res.pointed).toBe(true);
-    expect(fallbackCalls).toBe(0);
-    expect(calls).toEqual([{ step: 'switch to razor tool', app: undefined, visualCue: undefined }]);
-    expect(res.text).toContain('Pointing at **"Razor Tool"**');
-    expect(res.text).toContain('System 1 only');
+    expect(res.target).toBe('system1');
+    if (res.target === 'system1') {
+      expect(res.pointed).toBe(true);
+      expect(res.text).toContain('Pointing at **"Razor Tool"**');
+      expect(res.text).toContain('System 1 only');
+    }
+    expect(calls).toEqual([{ step: 'switch to razor tool', app: 'FilmCraft', visualCue: undefined }]);
   });
 
-  test('System-1 reobserve miss escalates to System-2 fallback and highlights the suggested prerequisite step', async () => {
-    const highlightCalls: { step: string; app?: string; visualCue?: string }[] = [];
-    let fallbackPrompt = '';
+  test('System-1 miss routes natively to fallback with miss diagnostics for buildTutorGuidance', async () => {
     const tutor: DirectTutorLike = {
-      async highlight(step, app, _sig, visualCue) {
-        highlightCalls.push({ step, app, visualCue });
-        if (highlightCalls.length === 1) {
-          return fakeResult({
-            ok: false,
-            decision: 'reobserve',
-            target: undefined,
-            message: 'No matching control was selected from this observation. A menu or panel may need opening first.',
-            selection: {
-              selectedId: 'ax:edit',
-              probability: 0.4,
-              margin: 0.1,
-              companion: { exactInNamed: 0.06, isHiddenSubcontrol: 0.91, likelyVisualTarget: 0.22 },
-              alternatives: [{ id: 'ax:edit', label: 'Edit', probability: 0.4 }],
-            },
-          });
-        }
+      async highlight() {
         return fakeResult({
-          ok: true,
-          target: { id: 'vis:export', label: 'Export', source: 'visual', probability: 0.94, point: { x: 761, y: 157 } },
-          jev: {
-            calls: 4,
-            requests: 4,
-            imageRequests: 3,
-            multipartRequests: 0,
-            inputTokens: 1200,
-            outputTokens: 20,
-            usageResponses: 4,
-            models: ['jev-1.14.0'],
-            provider: 'live',
-            rounds: 2,
-            path: 'box',
+          ok: false,
+          decision: 'reobserve',
+          target: undefined,
+          message: 'No matching control was selected from this observation. A menu or panel may need opening first.',
+          selection: {
+            selectedId: 'ax:edit',
+            probability: 0.4,
+            margin: 0.1,
+            companion: { exactInNamed: 0.06, isHiddenSubcontrol: 0.91, likelyVisualTarget: 0.22 },
+            alternatives: [{ id: 'ax:edit', label: 'Edit', probability: 0.4 }],
           },
-          screenshotRequests: 2,
         });
       },
     };
 
-    const res = await handleDirectTurn({
-      rawUserText: 'change the export codec to ProRes',
-      history: [{ role: 'user', text: 'change the export codec to ProRes' }],
+    const res = await decideTutorRoute({
+      messages: [{ type: 'user', id: 'u2', text: 'change the export codec to ProRes' }],
       tutor,
-      fallback: async (prompt) => {
-        fallbackPrompt = prompt;
-        return JSON.stringify({
-          reply: 'Codec settings live in the Export workspace. Click the Export tab first, then we can select ProRes.',
-          next_step: 'switch to the Export workspace',
-          visual_cue: 'Export tab in top-left header',
-          app: null,
-        });
-      },
-      fallbackModel: parseModelRef(DEFAULT_FALLBACK_MODEL),
+      sessionApp: 'FilmCraft',
+      hasFallbackModel: true,
     });
 
-    expect(res.escalated).toBe(true);
-    expect(res.pointed).toBe(true);
-    expect(fallbackPrompt).toContain('is_hidden_subcontrol=0.91');
-    expect(highlightCalls).toEqual([
-      { step: 'change the export codec to ProRes', app: undefined, visualCue: undefined },
-      { step: 'switch to the Export workspace', app: 'FilmCraft', visualCue: 'Export tab in top-left header' },
-    ]);
-    expect(res.text).toContain('Codec settings live in the Export workspace');
-    expect(res.text).toContain('Pointing at **"Export"**');
-    expect(res.text).toContain('opencode-go/glm-5.3-flash#high');
+    expect(res.target).toBe('fallback');
+    if (res.target === 'fallback') {
+      expect(res.miss?.decision).toBe('reobserve');
+      const guidance = buildTutorGuidance({ sessionApp: 'FilmCraft', autoLaunch: true, miss: res.miss });
+      expect(guidance).toContain('is_hidden_subcontrol=0.91');
+      expect(guidance).toContain('"Edit"');
+      expect(guidance).toContain('tutor_highlight');
+    }
   });
 
-  test('does NOT escalate on stale/unavailable/cancelled errors and degrades cleanly if fallback throws', async () => {
+  test('tool-loop continuation routes straight to fallback in 0ms without re-running Jev or System 1', async () => {
+    let gateCalls = 0;
+    let highlightCalls = 0;
+    const res = await decideTutorRoute({
+      messages: [
+        { type: 'user', id: 'u1', text: 'I want to learn FilmCraft today' },
+        { type: 'assistant', id: 'a1', content: [{ type: 'tool', name: 'tutor_set_app' }] },
+      ],
+      tutor: {
+        async highlight() {
+          highlightCalls++;
+          return fakeResult();
+        },
+      },
+      intentClassifier: async () => {
+        gateCalls++;
+        return { wantsUiPointer: 0, isConceptualOrChat: 1, explicitDoForMe: 0, switchesApp: 0, latencyMs: 10 };
+      },
+      hasFallbackModel: true,
+    });
+    expect(res.target).toBe('fallback');
+    expect(gateCalls).toBe(0);
+    expect(highlightCalls).toBe(0);
+  });
+
+  test('does NOT escalate on stale/unavailable/cancelled errors', () => {
     expect(shouldEscalateToSystem2(fakeResult({ ok: false, decision: 'stale' }))).toBe(false);
     expect(shouldEscalateToSystem2(fakeResult({ ok: false, decision: 'unavailable' }))).toBe(false);
     expect(shouldEscalateToSystem2(fakeResult({ ok: false, decision: 'cancelled' }))).toBe(false);
     expect(shouldEscalateToSystem2(fakeResult({ ok: false, decision: 'reobserve' }))).toBe(true);
     expect(shouldEscalateToSystem2(fakeResult({ ok: false, decision: 'abstain' }))).toBe(true);
-
-    const tutor: DirectTutorLike = {
-      async highlight() {
-        return fakeResult({ ok: false, decision: 'abstain', target: undefined, message: 'No matching control.' });
-      },
-    };
-    const res = await handleDirectTurn({
-      rawUserText: 'what is a J-cut?',
-      history: [{ role: 'user', text: 'what is a J-cut?' }],
-      tutor,
-      fallback: async () => {
-        throw new Error('offline');
-      },
-      fallbackModel: parseModelRef(DEFAULT_FALLBACK_MODEL),
-    });
-    expect(res.escalated).toBe(true);
-    expect(res.pointed).toBe(false);
-    expect(res.text).toContain('No matching control.');
-    expect(res.text).toContain('offline');
   });
 
-  test('Jev Intent Gate routes delegation, conceptual chat, natural app switching, and remembers sessionApp across turns', async () => {
+  test('Jev Intent Gate routes intro, conceptual/websearch, delegation, fast System-1 hit, and natural open-app switch', async () => {
     const intents = new Map<string, IntentSignals>([
       ['I want to learn FilmCraft today', { wantsUiPointer: 0.04, isConceptualOrChat: 0.98, explicitDoForMe: 0.01, switchesApp: 0.98, latencyMs: 85 }],
       ['switch to the razor tool', { wantsUiPointer: 0.99, isConceptualOrChat: 0.02, explicitDoForMe: 0.02, switchesApp: 0.03, latencyMs: 90 }],
@@ -241,7 +198,6 @@ describe('Direct Tutor System-1-first + System-2 fallback orchestration', () => 
     ]);
 
     const highlightCalls: { step: string; app?: string }[] = [];
-    let fallbackCalls = 0;
     let remembered: string | undefined;
 
     const tutor: DirectTutorLike = {
@@ -254,118 +210,107 @@ describe('Direct Tutor System-1-first + System-2 fallback orchestration', () => 
       },
     };
     const intentClassifier = async (msg: string) => intents.get(msg)!;
-    const fallback = async (prompt: string) => {
-      fallbackCalls++;
-      if (prompt.includes('I want to learn FilmCraft today')) {
-        return JSON.stringify({ reply: 'Ready to help you learn FilmCraft!', app: 'FilmCraft', next_step: null, visual_cue: null });
-      }
-      expect(prompt).toContain('Remembered app for this session: FilmCraft');
-      return JSON.stringify({ reply: 'A J-cut starts the next clip audio early.', app: null, next_step: null, visual_cue: null });
-    };
 
-    // Turn 1: User introduces FilmCraft -> skips Cua Driver completely, remembers FilmCraft
-    const t1 = await handleDirectTurn({
-      rawUserText: 'I want to learn FilmCraft today',
-      history: [{ role: 'user', text: 'I want to learn FilmCraft today' }],
+    // Turn 1: Intro -> routes natively to System 2 (which calls `tutor_set_app`)
+    const t1 = await decideTutorRoute({
+      messages: [{ type: 'user', id: 'u1', text: 'I want to learn FilmCraft today' }],
       tutor,
       sessionApp: remembered,
       onSessionApp: (a) => { remembered = a; },
       intentClassifier,
-      fallback,
-      fallbackModel: parseModelRef(DEFAULT_FALLBACK_MODEL),
+      hasFallbackModel: true,
     });
-    expect(t1.route).toBe('conceptual');
-    expect(remembered).toBe('FilmCraft');
+    expect(t1.target).toBe('fallback');
     expect(highlightCalls).toHaveLength(0);
-    expect(fallbackCalls).toBe(1);
 
-    // Turn 2: User asks without naming any app -> uses remembered FilmCraft, ZERO System 2
-    const t2 = await handleDirectTurn({
-      rawUserText: 'switch to the razor tool',
-      history: [{ role: 'user', text: 'switch to the razor tool' }],
+    // Simulate System 2 calling `tutor_set_app({ app: "FilmCraft" })`
+    remembered = 'FilmCraft';
+
+    // Turn 2: UI request -> System 1 directly, ZERO System 2
+    const t2 = await decideTutorRoute({
+      messages: [{ type: 'user', id: 'u2', text: 'switch to the razor tool' }],
       tutor,
       sessionApp: remembered,
       onSessionApp: (a) => { remembered = a; },
       intentClassifier,
-      fallback,
-      fallbackModel: parseModelRef(DEFAULT_FALLBACK_MODEL),
+      hasFallbackModel: true,
     });
-    expect(t2.route).toBe('system1');
-    expect(t2.escalated).toBe(false);
-    expect(t2.pointed).toBe(true);
+    expect(t2.target).toBe('system1');
+    if (t2.target === 'system1') expect(t2.pointed).toBe(true);
     expect(highlightCalls).toEqual([{ step: 'switch to the razor tool', app: 'FilmCraft' }]);
-    expect(fallbackCalls).toBe(1);
 
-    // Turn 3: Conceptual question -> skips Cua Driver completely, passes remembered FilmCraft to System 2
-    const t3 = await handleDirectTurn({
-      rawUserText: 'what is a J-cut?',
-      history: [{ role: 'user', text: 'what is a J-cut?' }],
+    // Turn 3: Conceptual / research question -> routes natively to System 2 (can call `websearch`, etc.)
+    const t3 = await decideTutorRoute({
+      messages: [{ type: 'user', id: 'u3', text: 'what is a J-cut?' }],
       tutor,
       sessionApp: remembered,
       onSessionApp: (a) => { remembered = a; },
       intentClassifier,
-      fallback,
-      fallbackModel: parseModelRef(DEFAULT_FALLBACK_MODEL),
+      hasFallbackModel: true,
     });
-    expect(t3.route).toBe('conceptual');
+    expect(t3.target).toBe('fallback');
     expect(highlightCalls).toHaveLength(1);
-    expect(fallbackCalls).toBe(2);
 
-    // Turn 4: Explicit delegation ("for me") -> instant point-only notice, ZERO Cua Driver, ZERO System 2
-    const t4 = await handleDirectTurn({
-      rawUserText: 'can you lock V1 for me?',
-      history: [{ role: 'user', text: 'can you lock V1 for me?' }],
+    // Turn 4: Explicit delegation ("for me") -> instant point-only notice, ZERO System 2
+    const t4 = await decideTutorRoute({
+      messages: [{ type: 'user', id: 'u4', text: 'can you lock V1 for me?' }],
       tutor,
       sessionApp: remembered,
       onSessionApp: (a) => { remembered = a; },
       intentClassifier,
-      fallback,
-      fallbackModel: parseModelRef(DEFAULT_FALLBACK_MODEL),
+      hasFallbackModel: true,
     });
-    expect(t4.route).toBe('delegation');
-    expect(t4.escalated).toBe(false);
+    expect(t4.target).toBe('system1');
+    if (t4.target === 'system1') expect(t4.route).toBe('delegation');
     expect(highlightCalls).toHaveLength(1);
-    expect(fallbackCalls).toBe(2);
 
-    // Turn 5: Natural switch to another open app ("in Keynote, add a new slide") -> matches locally, ZERO System 2
-    const t5 = await handleDirectTurn({
-      rawUserText: 'in Keynote, add a new slide',
-      history: [{ role: 'user', text: 'in Keynote, add a new slide' }],
+    // Turn 5: Natural switch to an explicitly named open app -> matches locally, ZERO System 2
+    const t5 = await decideTutorRoute({
+      messages: [{ type: 'user', id: 'u5', text: 'in Keynote, add a new slide' }],
       tutor,
       sessionApp: remembered,
       onSessionApp: (a) => { remembered = a; },
       intentClassifier,
-      fallback,
-      fallbackModel: parseModelRef(DEFAULT_FALLBACK_MODEL),
+      hasFallbackModel: true,
     });
-    expect(t5.route).toBe('system1');
+    expect(t5.target).toBe('system1');
     expect(remembered).toBe('Keynote');
     expect(highlightCalls.at(-1)).toEqual({ step: 'in Keynote, add a new slide', app: 'Keynote' });
-    expect(fallbackCalls).toBe(2);
   });
 
-  test('recovers to frontmost app when remembered sessionApp window was closed', async () => {
-    let remembered: string | undefined = 'FilmCraft';
-    const seenApps: (string | undefined)[] = [];
+  test('when sessionApp is unset and user gives a generic UI step, routes to System 2 (or asks when fallback disabled) and NEVER calls highlight', async () => {
+    let highlightCalls = 0;
     const tutor: DirectTutorLike = {
-      async highlight(_step, app) {
-        seenApps.push(app);
-        if (app === 'FilmCraft') {
-          return fakeResult({ ok: false, decision: 'error', target: undefined, message: 'Tutor error: FilmCraft has no on-screen window. Open it first.' });
-        }
-        return fakeResult({ app: 'Keynote' });
+      async highlight() {
+        highlightCalls++;
+        return fakeResult();
+      },
+      async matchOpenApp() {
+        return undefined;
       },
     };
-    const res = await handleDirectTurn({
-      rawUserText: 'add a slide',
-      history: [{ role: 'user', text: 'add a slide' }],
+
+    const withFallback = await decideTutorRoute({
+      messages: [{ type: 'user', id: 'u1', text: 'switch to the razor tool' }],
       tutor,
-      sessionApp: remembered,
-      onSessionApp: (a) => { remembered = a; },
+      sessionApp: undefined,
+      hasFallbackModel: true,
     });
-    expect(res.pointed).toBe(true);
-    expect(seenApps).toEqual(['FilmCraft', undefined]);
-    expect(remembered).toBe('Keynote');
+    expect(withFallback.target).toBe('fallback');
+    expect(highlightCalls).toBe(0);
+
+    const noFallback = await decideTutorRoute({
+      messages: [{ type: 'user', id: 'u1', text: 'switch to the razor tool' }],
+      tutor,
+      sessionApp: undefined,
+      hasFallbackModel: false,
+    });
+    expect(noFallback.target).toBe('system1');
+    if (noFallback.target === 'system1') {
+      expect(noFallback.route).toBe('no_app');
+      expect(noFallback.text).toMatch(/No app is selected/i);
+    }
+    expect(highlightCalls).toBe(0);
   });
 
   test('liveIntentClassifier sends 4 orthogonal atomic Nouls in one text-only request', async () => {
@@ -422,33 +367,29 @@ describe('Direct Tutor System-1-first + System-2 fallback orchestration', () => 
   });
 });
 
-describe('Direct loopback OpenAI-compatible HTTP server', () => {
-  test('enforces Bearer auth, handles SSE streaming, JSON mode, and zero-LLM title requests', async () => {
-    const seenSessions: string[] = [];
-    const srv = startDirectServer({
-      getTutor: (sessionID) => {
-        seenSessions.push(sessionID);
-        return { async highlight() { return fakeResult(); } };
+describe('Loopback OpenAI-compatible ReplyServer (`startReplyServer`)', () => {
+  test('enforces Bearer auth, streams pending System-1 SSE with zero usage, and handles titles without an LLM', async () => {
+    const pending = new Map<string, string>([['ses_1', 'Pointing at **"Razor Tool"**. Click it yourself.']]);
+    const srv = startReplyServer({
+      consumePendingText: (id) => {
+        const t = pending.get(id);
+        pending.delete(id);
+        return t;
       },
     });
     try {
-      // Unauthorized rejected
       const unauth = await fetch(`${srv.baseURL}/chat/completions`, { method: 'POST', body: '{}' });
       expect(unauth.status).toBe(401);
 
-      // Streaming SSE request
       const sse = await fetch(`${srv.baseURL}/chat/completions`, {
         method: 'POST',
         headers: {
-          authorization: `Bearer ${srv.token}`,
+          'x-tutor-token': srv.token,
           'content-type': 'application/json',
-          'x-tutor-session-id': 'ses_test1',
+          'x-tutor-session-id': 'ses_1',
+          'x-tutor-kind': 'primary',
         },
-        body: JSON.stringify({
-          model: 'tutor',
-          stream: true,
-          messages: [{ role: 'user', content: 'switch to razor tool' }],
-        }),
+        body: JSON.stringify({ model: 'tutor', stream: true, messages: [{ role: 'user', content: 'switch to razor tool' }] }),
       });
       expect(sse.status).toBe(200);
       expect(sse.headers.get('content-type')).toContain('text/event-stream');
@@ -456,25 +397,18 @@ describe('Direct loopback OpenAI-compatible HTTP server', () => {
       expect(raw).toContain('Pointing at **\\"Razor Tool\\"**');
       expect(raw).toContain('"finish_reason":"stop"');
       expect(raw).toContain('data: [DONE]');
-      expect(seenSessions).toEqual(['ses_test1']);
 
-      // Non-streaming title request bypasses tutor entirely
       const title = await fetch(`${srv.baseURL}/chat/completions`, {
         method: 'POST',
         headers: {
-          authorization: `Bearer ${srv.token}`,
+          'x-tutor-token': srv.token,
           'content-type': 'application/json',
           'x-tutor-kind': 'title',
         },
-        body: JSON.stringify({
-          model: 'tutor',
-          stream: false,
-          messages: [{ role: 'user', content: '@FilmCraft mute audio track 1' }],
-        }),
+        body: JSON.stringify({ model: 'tutor', stream: false, messages: [{ role: 'user', content: '@FilmCraft mute audio track 1' }] }),
       });
       const json = (await title.json()) as { choices: [{ message: { content: string } }] };
       expect(json.choices[0].message.content).toBe('FilmCraft: mute audio track 1');
-      expect(seenSessions).toHaveLength(1);
     } finally {
       srv.close();
     }

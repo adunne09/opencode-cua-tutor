@@ -1,4 +1,5 @@
 /** One bounded, cancellable tutor step. Only the user clicks. */
+import { defaultAppLauncher, type AppLauncher } from './apps.js';
 import { axCandidates, type CandidateTable, type Rect, type TutorCandidate } from './candidates.js';
 import type { TutorConfig } from './config.js';
 import { CuaDriver, type WindowInfo } from './driver.js';
@@ -20,7 +21,16 @@ import {
 } from './jev.js';
 import { cropCandidate, decodeScreenshot, normalizeScreenshot, patchUnchanged, type Screenshot } from './visual.js';
 
-export const TUTOR_REVISION = 'jev-box-20261119.3';
+export const TUTOR_REVISION = 'jev-box-20261120.2';
+
+export type SetAppResult = {
+  ok: boolean;
+  appName: string;
+  windowTitle?: string;
+  open: boolean;
+  launched: boolean;
+  message: string;
+};
 
 export type HighlightResult = {
   ok: boolean;
@@ -77,22 +87,160 @@ export class Tutor {
   readonly driver: CuaDriver;
   private readonly chooser: Chooser;
   private readonly boxEngine?: BoxEngine;
+  private readonly launcher: AppLauncher;
   private pending: Promise<unknown> = Promise.resolve();
   private active?: AbortController;
   private disposed = false;
 
-  constructor(readonly config: TutorConfig, chooser?: Chooser, driver?: CuaDriver, boxEngine?: BoxEngine) {
+  constructor(
+    readonly config: TutorConfig,
+    chooser?: Chooser,
+    driver?: CuaDriver,
+    boxEngine?: BoxEngine,
+    launcher?: AppLauncher
+  ) {
     this.driver = driver ?? new CuaDriver(config.driverBinary, config.driverSession);
     this.chooser = chooser ?? (config.provider === 'live' ? liveChooser(config.jevModel) : mockChooser());
     this.boxEngine =
       boxEngine ?? (config.visual && config.provider === 'live' && !chooser ? liveBoxEngine(config.boxModel) : undefined);
+    this.launcher = launcher ?? defaultAppLauncher();
+  }
+
+  private async waitForWindow(appName: string, signal?: AbortSignal, waitMs = 5000): Promise<WindowInfo | undefined> {
+    const deadline = Date.now() + waitMs;
+    while (Date.now() <= deadline) {
+      signal?.throwIfAborted();
+      try {
+        return await this.driver.findWindow(appName, signal);
+      } catch {
+        signal?.throwIfAborted();
+      }
+      if (Date.now() >= deadline) break;
+      await new Promise<void>((resolve, reject) => {
+        const t = setTimeout(() => {
+          signal?.removeEventListener('abort', onAbort);
+          resolve();
+        }, 250);
+        const onAbort = () => {
+          clearTimeout(t);
+          reject(signal?.reason ?? new Error('Aborted'));
+        };
+        signal?.addEventListener('abort', onAbort, { once: true });
+      });
+    }
+    return undefined;
+  }
+
+  /**
+   * Resolve an explicitly specified app name/bundle id to an open window, auto-launching a verified
+   * installed macOS `.app` bundle when `config.autoLaunch` is enabled and no window is open yet.
+   */
+  private async resolveOrLaunchWindow(app: string, signal: AbortSignal): Promise<WindowInfo> {
+    try {
+      return await this.driver.findWindow(app, signal);
+    } catch (firstError) {
+      signal.throwIfAborted();
+      if (!this.config.autoLaunch) throw firstError;
+      const installed = this.launcher.resolve(app);
+      if (!installed) throw firstError;
+      if (installed.name.toLowerCase() !== app.toLowerCase()) {
+        try {
+          return await this.driver.findWindow(installed.name, signal);
+        } catch {
+          signal.throwIfAborted();
+        }
+      }
+      await this.launcher.launch(installed.path, signal);
+      const win = await this.waitForWindow(installed.name, signal);
+      if (win) return win;
+      throw new Error(`Launched ${installed.name}, but no on-screen window appeared yet. Wait a moment and try again.`);
+    }
+  }
+
+  /**
+   * Validate and select the session's target app (called by `tutor_set_app`). If not already open
+   * and `config.autoLaunch` is enabled, launches the verified installed macOS `.app` bundle.
+   */
+  async setApp(appQuery: string, signal?: AbortSignal): Promise<SetAppResult> {
+    const query = appQuery.trim();
+    if (!query) {
+      return { ok: false, appName: '', open: false, launched: false, message: 'Provide a non-empty application name or bundle id.' };
+    }
+    try {
+      const win = await this.driver.findWindow(query, signal);
+      const appName = win.app_name?.trim() || query;
+      return {
+        ok: true,
+        appName,
+        windowTitle: win.title,
+        open: true,
+        launched: false,
+        message: `Current tutor app set to "${appName}" (already open${win.title ? ` — window "${win.title}"` : ''}).`,
+      };
+    } catch {
+      signal?.throwIfAborted();
+    }
+
+    const installed = this.launcher.resolve(query);
+    if (!installed) {
+      return {
+        ok: false,
+        appName: query,
+        open: false,
+        launched: false,
+        message: `Could not find an open window or installed macOS app matching "${query}". Check the exact app name.`,
+      };
+    }
+
+    // Check if the canonical bundle name is already open (e.g. query "Chrome" -> "Google Chrome")
+    if (installed.name.toLowerCase() !== query.toLowerCase()) {
+      try {
+        const win = await this.driver.findWindow(installed.name, signal);
+        const appName = win.app_name?.trim() || installed.name;
+        return {
+          ok: true,
+          appName,
+          windowTitle: win.title,
+          open: true,
+          launched: false,
+          message: `Current tutor app set to "${appName}" (already open${win.title ? ` — window "${win.title}"` : ''}).`,
+        };
+      } catch {
+        signal?.throwIfAborted();
+      }
+    }
+
+    if (!this.config.autoLaunch) {
+      return {
+        ok: true,
+        appName: installed.name,
+        open: false,
+        launched: false,
+        message: `Current tutor app set to "${installed.name}", but it is not open yet (autoLaunch is disabled). Open it before highlighting.`,
+      };
+    }
+
+    await this.launcher.launch(installed.path, signal);
+    const win = await this.waitForWindow(installed.name, signal);
+    const appName = win?.app_name?.trim() || installed.name;
+    return {
+      ok: true,
+      appName,
+      windowTitle: win?.title,
+      open: Boolean(win),
+      launched: true,
+      message: win
+        ? `Current tutor app set to "${appName}" (automatically launched — window "${win.title ?? appName}" is ready).`
+        : `Current tutor app set to "${appName}" (automatically launched; window is still starting up).`,
+    };
   }
 
   private async observe(app: string | undefined, signal: AbortSignal, visual = false, knownWindow?: WindowInfo): Promise<Observed> {
     const target = app?.trim() || this.config.defaultApp;
-    const window =
-      knownWindow ??
-      (target ? await this.driver.findWindow(target, signal) : await this.driver.frontmostWindow(this.config.ignoreApps, signal));
+    if (!knownWindow && !target) {
+      throw new Error('No application specified. Specify the app name or bundle id first.');
+    }
+    const window = knownWindow ?? (await this.resolveOrLaunchWindow(target!, signal));
     let { data, images } = await this.driver.windowState(window.pid, window.window_id, signal, visual);
     signal.throwIfAborted();
     if (axCandidates(data, window.pid, window.window_id).coverage.status === 'partial') {
@@ -176,10 +324,10 @@ export class Tutor {
     return true;
   }
 
-  /** Match a non-ignored on-screen app whose name is explicitly mentioned in `text`. */
+  /** Match an on-screen app whose name is explicitly mentioned in `text`. Never guesses an unmentioned app. */
   async matchOpenApp(text: string, signal?: AbortSignal): Promise<string | undefined> {
     try {
-      const names = await this.driver.openAppNames(this.config.ignoreApps, signal);
+      const names = await this.driver.openAppNames(signal);
       const lower = text.toLowerCase();
       for (const name of names) {
         const escaped = name.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -285,6 +433,14 @@ export class Tutor {
     try {
       await this.driver.clear();
       signal.throwIfAborted();
+      const targetApp = app?.trim() || this.config.defaultApp;
+      if (!targetApp) {
+        return result(
+          false,
+          'error',
+          'No application specified. Specify the app name or bundle id (e.g. "FilmCraft" or "Keynote") before highlighting.'
+        );
+      }
       if (this.config.provider === 'live' && !process.env.TYPESAFE_API_KEY?.trim()) {
         return result(
           false,
@@ -292,7 +448,7 @@ export class Tutor {
           'TypeSafe is unavailable: configure TYPESAFE_API_KEY for the OpenCode service. Mock mode is development-only and must be selected explicitly.'
         );
       }
-      observed = await this.observe(app, signal);
+      observed = await this.observe(targetApp, signal);
       timingsMs.observe = Math.round(performance.now() - t0);
       if (!usable(observed)) {
         return result(

@@ -3,21 +3,6 @@ import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-/**
- * Apps that are never "the app you're learning": where you talk to OpenCode or dictate.
- * When no app is named, the tutor uses the frontmost on-screen window of any other app.
- */
-export const DEFAULT_IGNORED_APPS = [
-  'OpenCode',
-  'Terminal',
-  'iTerm2',
-  'Ghostty',
-  'WezTerm',
-  'Alacritty',
-  'kitty',
-  'Warp',
-];
-
 export type ModelRef = {
   providerID: string;
   id: string;
@@ -58,10 +43,8 @@ export function formatModelRef(ref: ModelRef): string {
 }
 
 export type TutorConfig = {
-  /** Pin the tutor to one app (name or bundle id). Unset = frontmost app that isn't ignored. */
+  /** Optional static app pin (name or bundle id). Unset = the user/caller must specify the app. */
   defaultApp?: string;
-  /** App names skipped when picking the frontmost app (case-insensitive exact match). */
-  ignoreApps: string[];
   /** Absolute cua-driver binary (the OpenCode background service may not have ~/.local/bin on PATH). */
   driverBinary: string;
   /** Public Cua Driver session label that owns the agent cursor. */
@@ -92,23 +75,19 @@ export type TutorConfig = {
   locateModel: string;
   /** Register the direct System-1 virtual model `Tutor` (`cua-tutor/tutor`) in OpenCode's model picker. */
   directModel: boolean;
-  /** Optional System-2 fallback model invoked only when `Tutor` (System 1) misses (reobserve/abstain/unsure). */
+  /** Optional System-2 fallback model invoked when `Tutor` routes to System 2 (conceptual, setup, or System-1 miss). */
   fallbackModel?: ModelRef;
-  /** Inject the tutor guidance into every agent-loop system prompt. */
+  /** Automatically launch an installed macOS `.app` bundle when the selected app is not open yet. */
+  autoLaunch: boolean;
+  /** Inject dynamic tutor guidance into `Tutor` System-2 turns. */
   injectGuidance: boolean;
-  /** Declare the `cua-driver` MCP server (only if you haven't defined one). */
+  /** Declare the global `cua-driver` MCP server (default false so zero tools leak outside `Tutor` mode). */
   declareMcp: boolean;
 };
 
 const num = (value: unknown): number | undefined => {
   const n = typeof value === 'string' && value.trim() ? Number(value) : value;
   return typeof n === 'number' && Number.isFinite(n) ? n : undefined;
-};
-
-const list = (value: unknown): string[] | undefined => {
-  if (Array.isArray(value)) return value.map(String).map((s) => s.trim()).filter(Boolean);
-  if (typeof value === 'string' && value.trim()) return value.split(',').map((s) => s.trim()).filter(Boolean);
-  return undefined;
 };
 
 /** cua-driver's installer puts the binary in ~/.local/bin by default (or /usr/local/bin). */
@@ -132,7 +111,6 @@ export function loadConfig(options: Record<string, unknown> = {}, env: NodeJS.Pr
   const app = pick('app', 'CUA_TUTOR_APP');
   return {
     defaultApp: typeof app === 'string' && app.trim() ? app.trim() : undefined,
-    ignoreApps: list(pick('ignoreApps', 'CUA_TUTOR_IGNORE_APPS')) ?? DEFAULT_IGNORED_APPS,
     driverBinary: resolveDriverBinary(pick('driverBinary', 'CUA_DRIVER_BIN'), env.HOME || homedir()),
     driverSession: String(pick('driverSession', 'CUA_TUTOR_DRIVER_SESSION') ?? 'cua-tutor'),
     provider,
@@ -151,7 +129,8 @@ export function loadConfig(options: Record<string, unknown> = {}, env: NodeJS.Pr
     locateModel: String(pick('locateModel', 'CUA_TUTOR_LOCATE_MODEL') ?? 'jev-1.14.0'),
     directModel: !['0', 'false', 'off'].includes(String(pick('directModel', 'CUA_TUTOR_DIRECT_MODEL') ?? 'true').toLowerCase()),
     fallbackModel: parseModelRef(pick('fallbackModel', 'CUA_TUTOR_FALLBACK_MODEL') ?? DEFAULT_FALLBACK_MODEL),
+    autoLaunch: !['0', 'false', 'off'].includes(String(pick('autoLaunch', 'CUA_TUTOR_AUTO_LAUNCH') ?? 'true').toLowerCase()),
     injectGuidance: options.injectGuidance !== false,
-    declareMcp: options.declareMcp !== false,
+    declareMcp: options.declareMcp === true,
   };
 }

@@ -1,7 +1,6 @@
 #!/usr/bin/env bun
 /**
  * Debug CLI outside OpenCode:
- *   bun bin/tutor.ts "open the export dialog"              # frontmost app
  *   bun bin/tutor.ts --app Keynote "add a new slide"
  *   bun bin/tutor.ts --verify --app Finder "create a new folder"   # also read back the agent cursor
  */
@@ -24,13 +23,14 @@ if (ci >= 0) {
   args.splice(ci, 2);
 }
 const text = args.join(' ').trim();
-if (!text) {
-  console.log('usage: bun bin/tutor.ts [--app <name or bundle id>] [--cue "<visual cue>"] "<one step you want to do>"');
+const config = loadConfig();
+const targetApp = app ?? config.defaultApp;
+if (!text || !targetApp) {
+  console.log('usage: bun bin/tutor.ts --app <name or bundle id> [--cue "<visual cue>"] "<one step you want to do>"');
   process.exit(2);
 }
-const config = loadConfig();
 const tutor = new Tutor(config);
-console.error(`[cua-tutor] provider=${config.provider} app=${app ?? config.defaultApp ?? '(frontmost)'} driver=${config.driverBinary}`);
+console.error(`[cua-tutor] provider=${config.provider} app=${targetApp} driver=${config.driverBinary}`);
 try {
   const result = await tutor.highlight(text, app, undefined, cue);
   const extra: Record<string, unknown> = {};

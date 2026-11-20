@@ -3,8 +3,9 @@ import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { DEFAULT_IGNORED_APPS, loadConfig, resolveDriverBinary } from '../src/config.js';
-import { GUIDANCE } from '../src/index.js';
+import { loadConfig, resolveDriverBinary } from '../src/config.js';
+import { buildTutorGuidance } from '../src/direct.js';
+import { resolveInstalledApp, type AppLauncher } from '../src/apps.js';
 import { PNG } from 'pngjs';
 
 import { axCandidates } from '../src/candidates.js';
@@ -25,16 +26,11 @@ describe('config', () => {
     expect(loadConfig({}, { HOME: '/nonexistent', CUA_TUTOR_APP: 'Notes' }).defaultApp).toBe('Notes');
     expect(loadConfig({ app: 'Keynote' }, { HOME: '/nonexistent' }).defaultApp).toBe('Keynote');
   });
-  test('ignored apps default, and can be overridden by list or comma string', () => {
-    expect(loadConfig({}, { HOME: '/nonexistent' }).ignoreApps).toEqual(DEFAULT_IGNORED_APPS);
-    expect(loadConfig({ ignoreApps: ['Zed'] }, { HOME: '/nonexistent' }).ignoreApps).toEqual(['Zed']);
-    expect(loadConfig({}, { HOME: '/nonexistent', CUA_TUTOR_IGNORE_APPS: 'Zed, Cursor' }).ignoreApps).toEqual(['Zed', 'Cursor']);
-  });
-  test('injectGuidance and declareMcp default on', () => {
+  test('injectGuidance and autoLaunch default on; declareMcp defaults off', () => {
     const c = loadConfig({}, { HOME: '/nonexistent' });
-    expect([c.injectGuidance, c.declareMcp]).toEqual([true, true]);
-    const off = loadConfig({ injectGuidance: false, declareMcp: false }, { HOME: '/nonexistent' });
-    expect([off.injectGuidance, off.declareMcp]).toEqual([false, false]);
+    expect([c.injectGuidance, c.autoLaunch, c.declareMcp]).toEqual([true, true, false]);
+    const custom = loadConfig({ injectGuidance: false, autoLaunch: false, declareMcp: true }, { HOME: '/nonexistent' });
+    expect([custom.injectGuidance, custom.autoLaunch, custom.declareMcp]).toEqual([false, false, true]);
   });
   test('driver binary falls back to PATH lookup when not installed in a known place', () => {
     expect(resolveDriverBinary(undefined, '/nonexistent')).toMatch(/cua-driver$/);
@@ -42,10 +38,30 @@ describe('config', () => {
   });
 });
 
-describe('guidance', () => {
-  test('is app-agnostic and names the tool', () => {
-    expect(GUIDANCE).toContain('tutor_highlight');
-    expect(GUIDANCE.toLowerCase()).not.toContain('filmcraft');
+describe('guidance and app resolution', () => {
+  test('guidance is app-agnostic, names tutor_set_app + tutor_highlight, and reflects live sessionApp', () => {
+    const gUnset = buildTutorGuidance({ sessionApp: undefined, autoLaunch: true });
+    expect(gUnset).toContain('tutor_set_app');
+    expect(gUnset).toContain('tutor_highlight');
+    expect(gUnset).toContain('(none yet)');
+    expect(gUnset.toLowerCase()).not.toContain('filmcraft');
+    const gSet = buildTutorGuidance({ sessionApp: 'Keynote', autoLaunch: true });
+    expect(gSet).toContain('**Keynote**');
+  });
+
+  test('resolveInstalledApp matches exact, normalized, alias, and unique prefix strictly against installed bundles', () => {
+    const installed = [
+      { name: 'FilmCraft', path: '/Applications/FilmCraft.app', normalized: 'filmcraft' },
+      { name: 'Google Chrome', path: '/Applications/Google Chrome.app', normalized: 'googlechrome' },
+      { name: 'Visual Studio Code', path: '/Applications/Visual Studio Code.app', normalized: 'visualstudiocode' },
+      { name: 'Adobe Premiere Pro 2026', path: '/Applications/Adobe Premiere Pro 2026.app', normalized: 'adobepremierepro2026' },
+    ];
+    expect(resolveInstalledApp('filmcraft', installed)?.path).toBe('/Applications/FilmCraft.app');
+    expect(resolveInstalledApp('Film Craft', installed)?.name).toBe('FilmCraft');
+    expect(resolveInstalledApp('Chrome', installed)?.name).toBe('Google Chrome');
+    expect(resolveInstalledApp('VS Code', installed)?.name).toBe('Visual Studio Code');
+    expect(resolveInstalledApp('Premiere', installed)?.name).toBe('Adobe Premiere Pro 2026');
+    expect(resolveInstalledApp('NotInstalledApp', installed)).toBeUndefined();
   });
 });
 
@@ -135,23 +151,36 @@ describe('end to end with a fake Cua Driver (mock Jev)', () => {
     const tutor = new Tutor(config, undefined, driver);
     try {
       const result = await tutor.highlight(step, app);
-      expect(existsSync(log)).toBe(true);
-      const calls = readFileSync(log, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+      const calls = existsSync(log)
+        ? readFileSync(log, 'utf8')
+            .trim()
+            .split('\n')
+            .filter(Boolean)
+            .map((l) => JSON.parse(l))
+        : [];
       return { result, calls, session: driver.session };
     } finally {
       await tutor.close();
     }
   }
 
-  test('frontmost app skips the terminal, points at the control, never clicks', async () => {
-    const { result, calls, session } = await run('switch to the razor tool');
+  test('refuses to guess an open app when no app is specified', async () => {
+    const { result, calls } = await run('switch to the razor tool');
+    expect(result.ok).toBe(false);
+    expect(result.decision).toBe('error');
+    expect(result.message).toMatch(/No application specified/i);
+    expect(calls).toEqual([]);
+  }, 20_000);
+
+  test('explicit app points at the control, verifies cursor readback, and never clicks', async () => {
+    const { result, calls, session } = await run('switch to the razor tool', 'DemoEditor');
     expect(result.ok).toBe(true);
     expect(result.app).toBe('DemoEditor');
     expect(result.target?.label).toBe('Razor Tool');
     expect(calls.map((c) => c.name)).not.toContain('click');
     const move = calls.find((c) => c.name === 'move_cursor');
     expect(move.args).toEqual({ x: 120, y: 210, session });
-    expect(calls.find(c => c.name === 'get_agent_cursor_state').args).toEqual({ session });
+    expect(calls.find((c) => c.name === 'get_agent_cursor_state').args).toEqual({ session });
     expect(result.cursorReadback).toEqual({ enabled: true, position: { x: 120, y: 210 }, matched: true });
     expect(result.cursorReadbackRequests).toBe(1);
     expect(calls.filter((c) => c.name === 'get_window_state').map((c) => c.args.include_screenshot)).toEqual([false, false]);
@@ -160,13 +189,7 @@ describe('end to end with a fake Cua Driver (mock Jev)', () => {
     });
   }, 20_000);
 
-  test('uses the system-frontmost app when it is not ignored', async () => {
-    const { result } = await run('make a new note', undefined, { FAKE_ACTIVE_APP: 'Notes' });
-    expect(result.app).toBe('Notes');
-    expect(result.target?.label).toBe('New Note');
-  }, 20_000);
-
-  test('explicit app (name or bundle id) wins over frontmost', async () => {
+  test('explicit app works by name or bundle id', async () => {
     const byName = await run('share the note', 'Notes');
     expect(byName.result.app).toBe('Notes');
     expect(byName.result.target?.label).toBe('Share Note');
@@ -211,10 +234,69 @@ describe('end to end with a fake Cua Driver (mock Jev)', () => {
     }
   }, 20_000);
 
-  test('unknown app is a clear error', async () => {
+  test('unknown app is a clear error when not installed', async () => {
     const { result } = await run('anything', 'NoSuchApp');
     expect(result.ok).toBe(false);
     expect(result.message).toMatch(/no on-screen window/);
+  }, 20_000);
+
+  test('setApp auto-launches a verified installed closed app and resolves its window', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cua-tutor-'));
+    const log = join(dir, 'calls.ndjson');
+    const config = loadConfig({ provider: 'mock', autoLaunch: true, driverBinary: join(import.meta.dir, 'fake-cua-driver.ts') }, { ...process.env, HOME: '/nonexistent' });
+    const driver = new CuaDriver(config.driverBinary, config.driverSession, { ...driverEnvironment(), FAKE_DRIVER_LOG: log });
+    const launched: string[] = [];
+    const launcher: AppLauncher = {
+      resolve: (q) =>
+        q.toLowerCase() === 'notes' || q.toLowerCase() === 'demoapp'
+          ? { name: 'Notes', path: '/System/Applications/Notes.app', normalized: 'notes' }
+          : undefined,
+      launch: async (p) => {
+        launched.push(p);
+      },
+    };
+    const tutor = new Tutor(config, undefined, driver, undefined, launcher);
+    try {
+      // Notes is already open in fake-cua-driver -> no launch needed
+      const openRes = await tutor.setApp('Notes');
+      expect(openRes.ok).toBe(true);
+      expect(openRes.appName).toBe('Notes');
+      expect(openRes.launched).toBe(false);
+      expect(launched).toEqual([]);
+
+      // Unknown app -> not found
+      const missingRes = await tutor.setApp('NonExistentApp');
+      expect(missingRes.ok).toBe(false);
+      expect(missingRes.message).toMatch(/Could not find/);
+
+      // Alias to installed app that is closed -> launches it
+      const closedLauncher: AppLauncher = {
+        resolve: (q) => (q === 'LaunchMe' ? { name: 'LaunchMe', path: '/Applications/LaunchMe.app', normalized: 'launchme' } : undefined),
+        launch: async (p) => {
+          launched.push(p);
+        },
+      };
+      const tutor2 = new Tutor(config, undefined, driver, undefined, closedLauncher);
+      // Wait only briefly by aborting or using a small fake driver window response; override findWindow on driver
+      const origFind = driver.findWindow.bind(driver);
+      let calls = 0;
+      driver.findWindow = async (app, sig) => {
+        if (app === 'LaunchMe') {
+          calls++;
+          if (calls === 1) throw new Error('LaunchMe has no on-screen window. Open it first.');
+          return { pid: 55, window_id: 77, app_name: 'LaunchMe', title: 'Welcome' };
+        }
+        return origFind(app, sig);
+      };
+      const launchRes = await tutor2.setApp('LaunchMe');
+      expect(launchRes.ok).toBe(true);
+      expect(launchRes.launched).toBe(true);
+      expect(launchRes.open).toBe(true);
+      expect(launchRes.appName).toBe('LaunchMe');
+      expect(launched).toEqual(['/Applications/LaunchMe.app']);
+    } finally {
+      await tutor.close();
+    }
   }, 20_000);
 });
 

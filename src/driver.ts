@@ -34,8 +34,6 @@ export type WindowInfo = {
   layer?: number;
 };
 
-type AppInfo = { name?: string; bundle_id?: string; pid?: number; running?: boolean; active?: boolean };
-
 const visible = (w: WindowInfo) => w.is_on_screen !== false && w.on_current_space !== false && (w.layer ?? 0) === 0;
 const byZ = (a: WindowInfo, b: WindowInfo) => (b.z_index ?? -1) - (a.z_index ?? -1);
 
@@ -168,43 +166,17 @@ export class CuaDriver {
     return this.windowsOf(await this.call('list_windows', { pid }, signal)).filter((w) => w.pid === pid).sort(byZ)[0];
   }
 
-  /** Unique non-ignored app names with an on-screen window, sorted longest-first for safe substring matching. */
-  async openAppNames(ignoreApps: string[], signal?: AbortSignal): Promise<string[]> {
-    const ignored = new Set(ignoreApps.map((a) => a.toLowerCase()));
+  /** Unique app names with an on-screen window, sorted longest-first for safe explicit-mention matching. */
+  async openAppNames(signal?: AbortSignal): Promise<string[]> {
     const windows = this.windowsOf(await this.call('list_windows', { on_screen_only: true }, signal));
     const seen = new Map<string, string>();
     for (const w of windows) {
       const name = w.app_name?.trim();
-      if (!name || ignored.has(name.toLowerCase())) continue;
+      if (!name) continue;
       const key = name.toLowerCase();
       if (!seen.has(key)) seen.set(key, name);
     }
     return [...seen.values()].sort((a, b) => b.length - a.length);
-  }
-
-  /**
-   * The window the user is working in: the system-frontmost app (list_apps `active`) unless it is
-   * ignored (OpenCode, terminals, dictation), else the top on-screen window of any non-ignored app.
-   */
-  async frontmostWindow(ignoreApps: string[], signal?: AbortSignal): Promise<WindowInfo> {
-    const ignored = new Set(ignoreApps.map((a) => a.toLowerCase()));
-    const isIgnored = (name?: string) => ignored.has((name ?? '').toLowerCase());
-    const windows = this.windowsOf(await this.call('list_windows', { on_screen_only: true }, signal))
-      .filter((w) => !isIgnored(w.app_name))
-      .sort(byZ);
-    try {
-      const apps = ((await this.call('list_apps', {}, signal)).apps ?? []) as AppInfo[];
-      const active = apps.find((a) => a.active);
-      if (active && !isIgnored(active.name)) {
-        const own = windows.find((w) => w.pid === active.pid);
-        if (own) return own;
-      }
-    } catch {
-      signal?.throwIfAborted();
-      // list_apps is a convenience; z-order alone is enough.
-    }
-    if (!windows.length) throw new Error('No on-screen app window to tutor. Open the app you want help with.');
-    return windows[0];
   }
 
   /** Full metadata makes walk-budget exhaustion distinguishable from unknown AX coverage. */

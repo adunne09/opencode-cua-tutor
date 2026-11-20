@@ -1,49 +1,46 @@
 /**
- * Direct System-1 virtual chat model (`cua-tutor/tutor`, displayed as "Tutor") for OpenCode.
+ * Direct System-1 / System-2 Router (`cua-tutor/tutor`) for OpenCode V2.
  *
- * Pipeline (System-One / atomic Noul architecture):
- * 1. Fast Jev Intent Gate (~90 ms, 4 orthogonal atomic Nouls in ONE parallel request, zero
- *    screenshots, zero Cua Driver call):
- *    - `explicit_do_for_me` >= 0.7 -> instant point-only notice (switch to a full model to act).
- *    - `is_conceptual_or_chat` >= 0.65 && `wants_ui_pointer` < 0.5 -> skip screen observation
- *      entirely and route straight to System-2 fallback (`opencode-go/glm-5.3-flash#high`), which
- *      answers AND remembers the app if the user named/switched the app they are learning.
- *    - Otherwise -> System 1 (`Tutor.highlight`) using the session's remembered app (or matching an
- *      explicitly named open app when `switches_app` >= 0.7, or frontmost non-ignored app).
- * 2. When System 1 succeeds -> immediate cursor pointer + concise reply (ZERO System-2 inference).
- * 3. When System 1 misses (`reobserve`, `abstain`, `unsure`, `partial`, or no open app window) ->
- *    escalate ONLY that turn to System-2 fallback (`opencode-go/glm-5.3-flash#high`), optionally
- *    highlighting any concrete visible prerequisite `next_step` it identifies.
- * 4. Session-scoped app memory remembers the app you are learning across turns without requiring
- *    you to repeat it.
+ * Architecture:
+ * - The `cua-tutor` provider exposes ONE visible model in OpenCode's picker (`CUA Tutor -> Tutor`,
+ *   `cua-tutor/tutor`) and ONE hidden fallback model (`cua-tutor/fallback`, cloned from the
+ *   configured `fallbackModel`, default `opencode-go/glm-5.3-flash#high`).
+ * - On every request for `cua-tutor/tutor`, `experimental.model.resolve` runs `decideTutorRoute`:
+ *   1. Tool-result / assistant continuations -> route immediately to `cua-tutor/fallback` (0 ms).
+ *   2. Fresh user prompt -> ~90 ms 4-Noul Jev Intent Gate (0 screenshots):
+ *      - `explicit_do_for_me` >= 0.7 -> instant point-only notice via `LanguageModelV3` (0 LLM tokens).
+ *      - `is_conceptual_or_chat` >= 0.65 && `wants_ui_pointer` < 0.5 -> route to `cua-tutor/fallback`
+ *        for a FULL native OpenCode agent loop (`tutor_set_app`, `websearch`, `webfetch`, `tutor_highlight`, etc.).
+ *      - UI pointer request when `sessionApp` is set (or explicitly named & open) -> run System 1
+ *        (`Tutor.highlight`) directly:
+ *          - HIT  -> serve instant pointer reply via `LanguageModelV3` (ZERO System-2 tokens).
+ *          - MISS -> route to `cua-tutor/fallback` with System-1 miss diagnostics injected into
+ *                    `session.hook("context")` so System 2 can coach, search docs, or highlight a prerequisite.
+ *      - UI pointer request when `sessionApp` is NOT set yet -> route to `cua-tutor/fallback` so
+ *        System 2 can call `tutor_set_app` (if an app was named) or ask which app the user wants to learn.
+ * - Outside `Tutor`, `session.hook("context")` strips `tutor_set_app` and `tutor_highlight` from
+ *   `event.tools` and injects zero guidance, keeping non-Tutor sessions 100% untouched.
  */
 import { randomUUID } from 'node:crypto';
 
-import { formatModelRef, type ModelRef } from './config.js';
 import type { IntentClassifier, IntentSignals } from './jev.js';
 import type { HighlightResult } from './tutor.js';
 
 export const DIRECT_PROVIDER_ID = 'cua-tutor';
 export const DIRECT_MODEL_ID = 'tutor';
+export const DIRECT_FALLBACK_MODEL_ID = 'fallback';
 export const DIRECT_MODEL_NAME = 'Tutor';
-
-export type ChatMessage = {
-  role: string;
-  content?: unknown;
-};
 
 export type DirectTutorLike = {
   highlight(step: string, app?: string, signal?: AbortSignal, visualCue?: string): Promise<HighlightResult>;
   matchOpenApp?(text: string, signal?: AbortSignal): Promise<string | undefined>;
 };
 
-export type FallbackGenerator = (prompt: string, signal?: AbortSignal) => Promise<string>;
-
-export type FallbackPlan = {
-  reply: string;
-  nextStep?: string;
-  visualCue?: string;
-  app?: string;
+export type TutorTurnState = {
+  mode: 'system1' | 'system2';
+  userMessageID?: string;
+  pendingText?: string;
+  miss?: HighlightResult;
 };
 
 /** Remove harness `<system-reminder>` blocks so only user-authored text reaches Jev. */
@@ -68,35 +65,63 @@ function contentToText(content: unknown): string {
   return '';
 }
 
-/** Extract the latest user utterance from an OpenAI Chat Completions `messages` array. */
-export function extractLastUserText(messages: unknown): string {
-  if (!Array.isArray(messages)) return '';
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i] as ChatMessage | undefined;
-    if (msg?.role !== 'user') continue;
-    const text = contentToText(msg.content);
-    if (text) return text;
-  }
-  return '';
-}
+const IGNORED_MESSAGE_TYPES = new Set([
+  'model-switched',
+  'agent-switched',
+  'location-switched',
+  'idle',
+  'system',
+  'compaction',
+]);
 
-/** Compact recent conversation turns (excluding system messages) for System-2 fallback context. */
-export function extractRecentHistory(messages: unknown, maxTurns = 6): { role: string; text: string }[] {
-  if (!Array.isArray(messages)) return [];
-  const turns: { role: string; text: string }[] = [];
-  for (const raw of messages) {
-    const msg = raw as ChatMessage | undefined;
-    if (!msg || (msg.role !== 'user' && msg.role !== 'assistant')) continue;
-    const text = contentToText(msg.content);
-    if (!text) continue;
-    turns.push({ role: msg.role, text: text.length > 400 ? `${text.slice(0, 400)}…` : text });
+export type SessionContextInspection = {
+  /** True when the latest conversational message is an assistant/tool step (System-2 loop continuation). */
+  isContinuation: boolean;
+  userMessageID?: string;
+  userText: string;
+};
+
+/**
+ * Inspect `ctx.session.context({ sessionID })` (OpenCode V2 `SessionMessage.Info[]`) or OpenAI-style
+ * messages to determine whether this request is a fresh user turn or a System-2 tool-loop continuation.
+ */
+export function inspectSessionMessages(messages: readonly unknown[]): SessionContextInspection {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const raw = messages[i];
+    if (!raw || typeof raw !== 'object') continue;
+    const m = raw as Record<string, unknown>;
+
+    // OpenCode V2 SessionMessage shape (`type: "user" | "assistant" | ...`)
+    if (typeof m.type === 'string') {
+      if (IGNORED_MESSAGE_TYPES.has(m.type)) continue;
+      if (m.type === 'user') {
+        const text =
+          typeof m.text === 'string'
+            ? stripSystemReminders(m.text)
+            : contentToText(m.content);
+        const id = typeof m.id === 'string' ? m.id : undefined;
+        return { isContinuation: false, userMessageID: id, userText: text };
+      }
+      // assistant / tool / synthetic / shell / skill after user => System-2 continuation
+      return { isContinuation: true, userText: '' };
+    }
+
+    // OpenAI / AI SDK message shape (`role: "user" | "assistant" | "tool" | "system"`)
+    if (typeof m.role === 'string') {
+      if (m.role === 'system') continue;
+      if (m.role === 'user') {
+        const id = typeof m.id === 'string' ? m.id : undefined;
+        return { isContinuation: false, userMessageID: id, userText: contentToText(m.content) };
+      }
+      return { isContinuation: true, userText: '' };
+    }
   }
-  return turns.slice(-maxTurns);
+  return { isContinuation: false, userText: '' };
 }
 
 /**
  * Parse optional leading `@AppName` or `@"App Name"` override from direct tutor input.
- * Plain text without `@...` uses the session's remembered app or the frontmost non-ignored app.
+ * Plain text without `@...` uses the session's remembered app.
  */
 export function parseDirectInput(raw: string): { app?: string; step: string } {
   const text = stripSystemReminders(raw).trim();
@@ -117,7 +142,7 @@ export function makeDirectTitle(raw: string): string {
 }
 
 const isMissingWindowError = (r: HighlightResult) =>
-  r.decision === 'error' && /has no on-screen window|No other on-screen app window/i.test(r.message);
+  r.decision === 'error' && /has no on-screen window|no installed macOS app|Launched .* no on-screen window/i.test(r.message);
 
 /** Escalate only when System 1 could not map the request to a visible single control. */
 export function shouldEscalateToSystem2(result: HighlightResult): boolean {
@@ -147,7 +172,7 @@ function summarizeSystem1Meta(r: HighlightResult): string {
   return parts.join(' · ');
 }
 
-function formatSystem1Success(r: HighlightResult, gateMs?: number): string {
+export function formatSystem1Success(r: HighlightResult, gateMs?: number): string {
   const headline = r.target?.label
     ? `Pointing at **"${r.target.label}"**. Click it yourself.`
     : r.message;
@@ -155,319 +180,242 @@ function formatSystem1Success(r: HighlightResult, gateMs?: number): string {
   return `${headline}\n\n<sub>${summarizeSystem1Meta(r)}${gate} · System 1 only</sub>`;
 }
 
-export function buildConceptualPrompt(args: {
-  message: string;
-  sessionApp?: string;
-  history: { role: string; text: string }[];
-}): string {
-  const { message, sessionApp, history } = args;
-  const prior = history.slice(0, -1);
-  return [
-    'You are the conversational coach inside OpenCode CUA Tutor on macOS.',
-    'The user is learning software and wants to do all clicking themselves — NEVER claim you clicked anything or ran tools.',
-    '',
-    `User message: ${JSON.stringify(message)}`,
-    `Remembered app for this session: ${sessionApp ?? '(none yet)'}`,
-    ...(prior.length
-      ? ['Recent session context:', ...prior.map((t) => `- ${t.role}: ${t.text}`)]
-      : []),
-    '',
-    'Respond with ONLY a single JSON object (no markdown fences, no extra text):',
-    '{',
-    '  "reply": "Clear, concise, friendly answer (1-4 short sentences). If the user is introducing which app they want to learn, acknowledge it and invite them to ask where any control is or any concept question.",',
-    '  "app": "If the user explicitly named or switched the macOS app they want to learn (e.g. \\"FilmCraft\\", \\"Keynote\\", \\"Blender\\"), put that app name here so the tutor remembers it for the rest of the session; otherwise null.",',
-    '  "next_step": null,',
-    '  "visual_cue": null',
-    '}',
-  ].join('\n');
-}
-
-export function buildFallbackPrompt(args: {
-  step: string;
-  app?: string;
-  result: HighlightResult;
-  history: { role: string; text: string }[];
-}): string {
-  const { step, app, result, history } = args;
-  const visibleControls = (result.selection?.alternatives ?? [])
-    .map((a) => a.label)
-    .filter((l) => l && !['abstain', 'reobserve', 'inspect'].includes(l))
-    .slice(0, 30);
-
-  const comp = result.selection?.companion;
-  const prior = history.slice(0, -1);
-
-  return [
-    'You are the System-2 fallback coach inside OpenCode CUA Tutor.',
-    'The user is LEARNING to use an app on macOS and wants to do all clicking themselves — NEVER claim you clicked anything.',
-    'System 1 (Jev) already tried to highlight a single currently-visible control and did NOT point.',
-    '',
-    `User request: ${JSON.stringify(step)}`,
-    `Detected/remembered app: ${result.app ?? app ?? '(unknown)'}`,
-    ...(result.window ? [`Window title: ${result.window}`] : []),
-    `System-1 outcome: ${result.decision ?? 'unknown'} — ${result.message}`,
-    ...(comp
-      ? [
-          `System-1 signals: exact_in_named=${comp.exactInNamed.toFixed(2)}, is_hidden_subcontrol=${comp.isHiddenSubcontrol.toFixed(2)}, likely_visual_target=${comp.likelyVisualTarget.toFixed(2)}`,
-        ]
-      : []),
-    ...(visibleControls.length
-      ? [`Top currently visible named controls: ${visibleControls.map((c) => JSON.stringify(c)).join(', ')}`]
-      : []),
-    ...(prior.length
-      ? ['Recent session context:', ...prior.map((t) => `- ${t.role}: ${t.text}`)]
-      : []),
-    '',
-    'Respond with ONLY a single JSON object (no markdown fences, no extra text):',
-    '{',
-    '  "reply": "1-3 short, clear sentences telling the user what to click next (and why) or answering their question.",',
-    '  "next_step": "ONE concrete control/tab/menu/button that is CURRENTLY visible on screen for them to click first so we can highlight it now, or null if purely conceptual, the app is closed, or nothing concrete is visible.",',
-    '  "visual_cue": "Optional short visual description of an unlabeled icon/canvas target (e.g. \\"Export tab in top-left header\\"), or null.",',
-    '  "app": "If the user explicitly named a specific macOS app to work in, put its exact name here; otherwise null."',
-    '}',
-  ].join('\n');
-}
-
-/** Parse structured JSON from the System-2 fallback model, degrading cleanly to plain prose. */
-export function parseFallbackJson(raw: string): FallbackPlan {
-  const trimmed = raw.trim();
-  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  const candidate = (fenced ? fenced[1] : trimmed).trim();
-  const start = candidate.indexOf('{');
-  const end = candidate.lastIndexOf('}');
-  if (start >= 0 && end > start) {
-    try {
-      const parsed = JSON.parse(candidate.slice(start, end + 1)) as Record<string, unknown>;
-      const reply = typeof parsed.reply === 'string' && parsed.reply.trim() ? parsed.reply.trim() : '';
-      const nextStep = typeof parsed.next_step === 'string' && parsed.next_step.trim() ? parsed.next_step.trim() : undefined;
-      const visualCue = typeof parsed.visual_cue === 'string' && parsed.visual_cue.trim() ? parsed.visual_cue.trim() : undefined;
-      const app = typeof parsed.app === 'string' && parsed.app.trim() ? parsed.app.trim() : undefined;
-      if (reply) return { reply, nextStep, visualCue, app };
-    } catch {
-      // Fall through to plain text reply
+export type RouteDecision =
+  | {
+      target: 'fallback';
+      userMessageID?: string;
+      miss?: HighlightResult;
+      intent?: IntentSignals;
+      sessionApp?: string;
     }
-  }
-  return { reply: trimmed || 'I could not find a matching control on screen. Try opening the relevant menu or panel first.' };
-}
+  | {
+      target: 'system1';
+      route: 'system1' | 'delegation' | 'no_app' | 'conceptual';
+      userMessageID?: string;
+      text: string;
+      pointed: boolean;
+      intent?: IntentSignals;
+      sessionApp?: string;
+    };
 
-export type DirectTurnOutcome = {
-  text: string;
-  route: 'system1' | 'conceptual' | 'delegation' | 'fallback';
-  escalated: boolean;
-  pointed: boolean;
-  sessionApp?: string;
-};
-
-export async function handleDirectTurn(args: {
-  rawUserText: string;
-  history: { role: string; text: string }[];
-  tutor: DirectTutorLike;
+/**
+ * Decide whether a `cua-tutor/tutor` request is handled directly by System 1 (zero LLM tokens)
+ * or routed natively to `cua-tutor/fallback` for a full OpenCode tool-calling System-2 loop.
+ */
+export async function decideTutorRoute(args: {
+  messages: readonly unknown[];
+  lastRoutedUserMessageID?: string;
   sessionApp?: string;
   onSessionApp?: (app: string | undefined) => void;
+  tutor: DirectTutorLike;
   intentClassifier?: IntentClassifier;
-  fallback?: FallbackGenerator;
-  fallbackModel?: ModelRef;
+  hasFallbackModel: boolean;
   signal?: AbortSignal;
-}): Promise<DirectTurnOutcome> {
-  const { app: explicitApp, step } = parseDirectInput(args.rawUserText);
-  let activeApp = explicitApp ?? args.sessionApp;
+}): Promise<RouteDecision> {
+  const inspected = inspectSessionMessages(args.messages);
+  let activeApp = args.sessionApp;
   const rememberApp = (app: string | undefined) => {
     const clean = app?.trim();
     if (!clean) return;
     activeApp = clean;
     args.onSessionApp?.(clean);
   };
-  if (explicitApp) rememberApp(explicitApp);
 
-  if (!step) {
+  // Tool-loop continuation (or repeated resolve for a user message already routed to System 2)
+  if (
+    inspected.isContinuation ||
+    (inspected.userMessageID && inspected.userMessageID === args.lastRoutedUserMessageID)
+  ) {
+    if (args.hasFallbackModel) {
+      return { target: 'fallback', userMessageID: inspected.userMessageID, sessionApp: activeApp };
+    }
     return {
-      text: 'Tell me what app you want to learn or what you want to do (e.g. `switch to the razor tool` or `what is a J-cut?`).',
+      target: 'system1',
       route: 'conceptual',
-      escalated: false,
+      userMessageID: inspected.userMessageID,
+      text: 'System-2 fallback is disabled.',
       pointed: false,
       sessionApp: activeApp,
     };
   }
 
-  const modelLabel = args.fallbackModel ? formatModelRef(args.fallbackModel) : 'System 2';
+  const { app: explicitApp, step } = parseDirectInput(inspected.userText);
+  if (explicitApp) rememberApp(explicitApp);
 
-  // Step 1: Fast atomic 4-Noul Jev Intent Gate (~90 ms, zero screenshots, zero Cua Driver calls)
+  if (!step) {
+    if (args.hasFallbackModel) {
+      return { target: 'fallback', userMessageID: inspected.userMessageID, sessionApp: activeApp };
+    }
+    return {
+      target: 'system1',
+      route: 'no_app',
+      userMessageID: inspected.userMessageID,
+      text: 'Tell me which app you want to learn or what you want to do (e.g. `I’m learning FilmCraft`).',
+      pointed: false,
+      sessionApp: activeApp,
+    };
+  }
+
+  // Fast 4-Noul Jev Intent Gate (~90 ms, zero screenshots, zero Cua Driver calls)
   let intent: IntentSignals | undefined;
   if (args.intentClassifier) {
     try {
       intent = await args.intentClassifier(step, activeApp, args.signal);
       args.signal?.throwIfAborted();
-    } catch (error) {
+    } catch {
       args.signal?.throwIfAborted();
-      // If the intent gate fails transiently, fall through safely to System 1 highlight.
-      void error;
     }
   }
 
   // Route A: Explicit delegation ("lock V1 for me", "export this for me") -> instant point-only notice
   if (intent && intent.explicitDoForMe >= 0.7) {
     return {
+      target: 'system1',
+      route: 'delegation',
+      userMessageID: inspected.userMessageID,
       text:
         'I’m in point-only **Tutor** mode, so I won’t click or operate apps for you. ' +
-        'Switch to a full model in the model picker if you want me to do that for you — or ask where the control is and I’ll point right at it.\n\n' +
+        'Switch to another model in the model picker if you want me to do that for you — or ask where the control is and I’ll point right at it.\n\n' +
         `<sub>Jev intent gate (${intent.latencyMs} ms · do=${intent.explicitDoForMe.toFixed(2)}) · 0 screenshots</sub>`,
-      route: 'delegation',
-      escalated: false,
       pointed: false,
+      intent,
       sessionApp: activeApp,
     };
   }
 
-  // Route B: Pure conceptual question / chat / introducing which app to learn -> skip Cua Driver & Box completely!
+  // Route B: Conceptual / chat / app intro / research -> native System-2 OpenCode agent loop
   if (intent && intent.isConceptualOrChat >= 0.65 && intent.wantsUiPointer < 0.5) {
-    if (!args.fallback) {
-      return {
-        text:
-          'That looks like a conceptual question rather than a single on-screen control, and System-2 fallback is disabled.\n\n' +
-          `<sub>Jev intent gate (${intent.latencyMs} ms · conceptual=${intent.isConceptualOrChat.toFixed(2)}) · 0 screenshots</sub>`,
-        route: 'conceptual',
-        escalated: false,
-        pointed: false,
-        sessionApp: activeApp,
-      };
+    if (args.hasFallbackModel) {
+      return { target: 'fallback', userMessageID: inspected.userMessageID, intent, sessionApp: activeApp };
     }
-    const t2 = performance.now();
-    try {
-      const raw = await args.fallback(
-        buildConceptualPrompt({ message: step, sessionApp: activeApp, history: args.history }),
-        args.signal
-      );
-      args.signal?.throwIfAborted();
-      const plan = parseFallbackJson(raw);
-      if (plan.app) rememberApp(plan.app);
-      const s2Ms = Math.round(performance.now() - t2);
-      const appTag = activeApp ? ` · app: ${activeApp}` : '';
-      return {
-        text:
-          `${plan.reply}\n\n` +
-          `<sub>Jev intent gate (${intent.latencyMs} ms, 0 screenshots) → ${modelLabel} (${s2Ms} ms)${appTag}</sub>`,
-        route: 'conceptual',
-        escalated: true,
-        pointed: false,
-        sessionApp: activeApp,
-      };
-    } catch (error) {
-      args.signal?.throwIfAborted();
-      const errMsg = error instanceof Error ? error.message : String(error);
-      return {
-        text: `System-2 fallback \`${modelLabel}\` failed: ${errMsg}`,
-        route: 'conceptual',
-        escalated: true,
-        pointed: false,
-        sessionApp: activeApp,
-      };
-    }
+    return {
+      target: 'system1',
+      route: 'conceptual',
+      userMessageID: inspected.userMessageID,
+      text:
+        'That looks like a conceptual question rather than a single on-screen control, and System-2 fallback is disabled.\n\n' +
+        `<sub>Jev intent gate (${intent.latencyMs} ms · conceptual=${intent.isConceptualOrChat.toFixed(2)}) · 0 screenshots</sub>`,
+      pointed: false,
+      intent,
+      sessionApp: activeApp,
+    };
   }
 
-  // Route C: UI pointer request — if the user naturally named a different open app (e.g. "in Keynote, add a slide"),
-  // match it against open macOS windows locally (~15 ms) without needing `@App` or System 2.
+  // Route C: UI pointer request — check if the user explicitly named an open app in their message
   let targetApp = activeApp;
-  let usedRememberedApp = !explicitApp && Boolean(args.sessionApp);
-  if (!explicitApp && intent && intent.switchesApp >= 0.7 && args.tutor.matchOpenApp) {
+  if (!explicitApp && args.tutor.matchOpenApp && (!activeApp || (intent && intent.switchesApp >= 0.7))) {
     const matched = await args.tutor.matchOpenApp(step, args.signal);
     args.signal?.throwIfAborted();
     if (matched) {
       rememberApp(matched);
       targetApp = matched;
-      usedRememberedApp = false;
     }
   }
 
-  let s1 = await args.tutor.highlight(step, targetApp, args.signal);
-  args.signal?.throwIfAborted();
-
-  // If the remembered sessionApp was closed since an earlier turn, recover seamlessly to frontmost non-ignored app.
-  if (!s1.ok && usedRememberedApp && isMissingWindowError(s1)) {
-    args.onSessionApp?.(undefined);
-    activeApp = undefined;
-    s1 = await args.tutor.highlight(step, undefined, args.signal);
-    args.signal?.throwIfAborted();
+  // Hard gate: no app set for this session yet -> let System 2 call `tutor_set_app` (or ask the user)
+  if (!targetApp) {
+    if (args.hasFallbackModel) {
+      return { target: 'fallback', userMessageID: inspected.userMessageID, intent, sessionApp: activeApp };
+    }
+    const gateNote = intent ? `\n\n<sub>Jev intent gate (${intent.latencyMs} ms) · 0 screenshots</sub>` : '';
+    return {
+      target: 'system1',
+      route: 'no_app',
+      userMessageID: inspected.userMessageID,
+      text:
+        'No app is selected for this session yet. Tell me which app you’re working in ' +
+        '(e.g. `I’m learning FilmCraft` or `@FilmCraft switch to the razor tool`), and I’ll remember it for the rest of the session.' +
+        gateNote,
+      pointed: false,
+      intent,
+      sessionApp: activeApp,
+    };
   }
+
+  // Run System 1 directly (zero System-2 tokens on hit)
+  const s1 = await args.tutor.highlight(step, targetApp, args.signal);
+  args.signal?.throwIfAborted();
 
   if (s1.ok) {
     if (s1.app) rememberApp(s1.app);
     return {
+      target: 'system1',
+      route: 'system1',
+      userMessageID: inspected.userMessageID,
       text: formatSystem1Success(s1, intent?.latencyMs),
-      route: 'system1',
-      escalated: false,
       pointed: true,
+      intent,
       sessionApp: activeApp,
     };
   }
 
-  if (!args.fallback || !shouldEscalateToSystem2(s1)) {
+  if (args.hasFallbackModel && shouldEscalateToSystem2(s1)) {
     return {
-      text: `${s1.message}\n\n<sub>${summarizeSystem1Meta(s1)} · ${s1.decision ?? 'no match'}</sub>`,
-      route: 'system1',
-      escalated: false,
-      pointed: false,
+      target: 'fallback',
+      userMessageID: inspected.userMessageID,
+      miss: s1,
+      intent,
       sessionApp: activeApp,
     };
   }
 
-  // System-1 miss (`reobserve`, `abstain`, `unsure`, `partial`, or missing window) -> System-2 fallback
-  const t2 = performance.now();
-  let plan: FallbackPlan;
-  try {
-    const raw = await args.fallback(
-      buildFallbackPrompt({ step, app: targetApp, result: s1, history: args.history }),
-      args.signal
-    );
-    args.signal?.throwIfAborted();
-    plan = parseFallbackJson(raw);
-    if (plan.app) rememberApp(plan.app);
-  } catch (error) {
-    args.signal?.throwIfAborted();
-    const errMsg = error instanceof Error ? error.message : String(error);
-    return {
-      text:
-        `${s1.message}\n\n` +
-        `*(System-2 fallback \`${modelLabel}\` failed: ${errMsg})*\n\n` +
-        `<sub>${summarizeSystem1Meta(s1)} · ${s1.decision ?? 'no match'}</sub>`,
-      route: 'fallback',
-      escalated: true,
-      pointed: false,
-      sessionApp: activeApp,
-    };
-  }
-  const s2Ms = Math.round(performance.now() - t2);
-
-  // If System 2 proposed a concrete visible prerequisite step (e.g. "switch to the Export workspace"),
-  // run System 1 once more to point the agent cursor directly at it.
-  let pointed = false;
-  let followNote = '';
-  const nextStep = plan.nextStep?.trim();
-  const shouldRetryHighlight =
-    Boolean(nextStep) &&
-    !isMissingWindowError(s1) &&
-    (nextStep!.toLowerCase() !== step.toLowerCase() || Boolean(plan.visualCue));
-
-  if (shouldRetryHighlight && nextStep) {
-    const s1b = await args.tutor.highlight(nextStep, targetApp ?? plan.app ?? s1.app, args.signal, plan.visualCue);
-    args.signal?.throwIfAborted();
-    if (s1b.ok) {
-      if (s1b.app) rememberApp(s1b.app);
-      pointed = true;
-      const targetNote = s1b.target?.label ? `Pointing at **"${s1b.target.label}"**` : 'Pointer placed on target';
-      followNote = `\n\n${targetNote} (${summarizeSystem1Meta(s1b)}).`;
-    }
-  }
-
-  const gateNote = intent ? `gate ${intent.latencyMs} ms + ` : '';
   return {
-    text:
-      `${plan.reply}${followNote}\n\n` +
-      `<sub>System 1 (${gateNote}${s1.decision ?? 'miss'}, ${s1.timingsMs.total ?? '-'} ms) → System 2 fallback (${modelLabel}, ${s2Ms} ms)</sub>`,
-    route: 'fallback',
-    escalated: true,
-    pointed,
+    target: 'system1',
+    route: 'system1',
+    userMessageID: inspected.userMessageID,
+    text: `${s1.message}\n\n<sub>${summarizeSystem1Meta(s1)} · ${s1.decision ?? 'no match'}</sub>`,
+    pointed: false,
+    intent,
     sessionApp: activeApp,
   };
+}
+
+/**
+ * Dynamic Tutor system instructions injected ONLY into `Tutor` (`cua-tutor/tutor`) System-2 turns.
+ * Never injected into non-Tutor models.
+ */
+export function buildTutorGuidance(args: {
+  sessionApp?: string;
+  autoLaunch: boolean;
+  miss?: HighlightResult;
+}): string {
+  const lines = [
+    'You are in **Tutor** mode (`cua-tutor/tutor`). The user is LEARNING to use macOS apps and wants to do all clicking themselves.',
+    `- Current tutor app for this session: ${args.sessionApp ? `**${args.sessionApp}**` : '**(none yet)**'}.`,
+    '- **Hard gate on `tutor_set_app`:** `tutor_highlight` CANNOT run until an application has been set for this session via `tutor_set_app`.',
+    `  - Whenever the user tells you which app they want to learn or explicitly switches to another app, call \`tutor_set_app({ app })\` first.${args.autoLaunch ? ' It validates against installed macOS apps and automatically launches the app if it is not open yet.' : ''}`,
+    '  - Do NOT call `tutor_set_app` just because the user mentions another app in a comparison or background remark (e.g. "How does this compare to Premiere Pro?" or "I used to use Resolve").',
+    '  - Never guess an app from open windows. If no app is set yet and the user has not named one, ask them which app they want to work in.',
+    '- **Pointing (`tutor_highlight`):** Once the app is set, call `tutor_highlight` with ONE concrete currently-visible step at a time (and an optional concrete `visualCue` for unlabeled icons or canvas elements). It moves an on-screen pointer and NEVER clicks. Then tell the user in 1–2 short sentences what to click and why, and wait for them to click it.',
+    '- **Learning & research:** You may freely use OpenCode’s normal read/research tools (such as `websearch`, `webfetch`, `read`) to answer conceptual questions, look up shortcuts/docs, or check how a feature works.',
+    '- **Point-only boundary:** NEVER click, type, edit files, or operate the target app on the user’s behalf. If they want automation, tell them to switch away from Tutor to a full model.',
+  ];
+
+  if (args.miss) {
+    const r = args.miss;
+    const visibleControls = (r.selection?.alternatives ?? [])
+      .map((a) => a.label)
+      .filter((l) => l && !['abstain', 'reobserve', 'inspect'].includes(l))
+      .slice(0, 25);
+    const comp = r.selection?.companion;
+    lines.push(
+      '',
+      '[System-1 pre-check on this turn — do NOT repeat the exact same failing step without changing it]',
+      `- App: ${r.app ?? args.sessionApp ?? '(unknown)'}${r.window ? ` (window: "${r.window}")` : ''}`,
+      `- Outcome: ${r.decision ?? 'miss'} — ${r.message}`,
+      ...(comp
+        ? [
+            `- Signals: exact_in_named=${comp.exactInNamed.toFixed(2)}, is_hidden_subcontrol=${comp.isHiddenSubcontrol.toFixed(2)}, likely_visual_target=${comp.likelyVisualTarget.toFixed(2)}`,
+          ]
+        : []),
+      ...(visibleControls.length
+        ? [`- Currently visible named controls: ${visibleControls.map((c) => JSON.stringify(c)).join(', ')}`]
+        : []),
+      '- If the requested control is hidden behind a currently-visible menu, tab, or panel, explain that briefly and call `tutor_highlight` on that visible prerequisite control instead.'
+    );
+  }
+
+  return lines.join('\n');
 }
 
 function sseChunk(
@@ -489,36 +437,41 @@ function sseChunk(
   return `data: ${JSON.stringify(payload)}\n\n`;
 }
 
-export type DirectServer = {
+function extractLastOpenAiUserText(messages: unknown): string {
+  if (!Array.isArray(messages)) return '';
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i] as { role?: unknown; content?: unknown } | undefined;
+    if (m?.role !== 'user') continue;
+    const text = contentToText(m.content);
+    if (text) return text;
+  }
+  return '';
+}
+
+export type ReplyServer = {
   baseURL: string;
   token: string;
   port: number;
-  sessionApps: Map<string, string>;
   close(): void;
 };
 
 /**
- * Ephemeral loopback OpenAI-compatible Chat Completions endpoint backing the `Tutor` virtual model.
- * Bound strictly to `127.0.0.1` and authenticated with a per-process Bearer secret.
+ * Tiny authenticated `127.0.0.1` OpenAI-compatible SSE emitter backing `cua-tutor/tutor`
+ * for zero-LLM System-1 responses (used because OpenCode's native `@opencode/ai/providers/openai-compatible`
+ * runs natively over HTTP rather than `@ai-sdk` language hooks).
  */
-export function startDirectServer(args: {
-  getTutor: (sessionID: string) => DirectTutorLike;
-  defaultApp?: string;
-  intentClassifier?: IntentClassifier;
-  fallback?: FallbackGenerator;
-  fallbackModel?: ModelRef;
-}): DirectServer {
+export function startReplyServer(args: {
+  consumePendingText: (sessionID: string) => string | undefined;
+}): ReplyServer {
   const token = randomUUID();
   const encoder = new TextEncoder();
-  const sessionApps = new Map<string, string>();
 
   const server = Bun.serve({
     hostname: '127.0.0.1',
     port: 0,
     idleTimeout: 120,
     async fetch(req) {
-      const auth = req.headers.get('authorization');
-      if (auth !== `Bearer ${token}`) {
+      if (req.headers.get('x-tutor-token') !== token) {
         return new Response(JSON.stringify({ error: { message: 'Unauthorized' } }), {
           status: 401,
           headers: { 'content-type': 'application/json' },
@@ -547,106 +500,44 @@ export function startDirectServer(args: {
         });
       }
 
-      const sessionID = req.headers.get('x-tutor-session-id') || 'direct-default';
+      const sessionID = req.headers.get('x-tutor-session-id') || '';
       const kind = req.headers.get('x-tutor-kind') || 'primary';
       const model = typeof body.model === 'string' && body.model ? body.model : DIRECT_MODEL_ID;
       const streamRequested = body.stream !== false;
-      const rawUserText = extractLastUserText(body.messages);
-      const history = extractRecentHistory(body.messages);
       const id = `chatcmpl-${randomUUID()}`;
       const created = Math.floor(Date.now() / 1000);
 
-      const produceText = async (signal?: AbortSignal): Promise<string> => {
-        if (kind === 'title') return makeDirectTitle(rawUserText);
-        if (kind === 'compaction') {
-          const recent = history
-            .filter((t) => t.role === 'user')
-            .slice(-5)
-            .map((t) => `- ${t.text}`)
-            .join('\n');
-          return recent ? `Tutor session steps:\n${recent}` : 'Tutor session summary.';
-        }
-        const tutor = args.getTutor(sessionID);
-        const turn = await handleDirectTurn({
-          rawUserText,
-          history,
-          tutor,
-          sessionApp: sessionApps.get(sessionID) ?? args.defaultApp,
-          onSessionApp: (app) => {
-            if (app) sessionApps.set(sessionID, app);
-            else sessionApps.delete(sessionID);
-          },
-          intentClassifier: args.intentClassifier,
-          fallback: args.fallback,
-          fallbackModel: args.fallbackModel,
-          signal,
-        });
-        return turn.text;
-      };
-
-      if (!streamRequested) {
-        try {
-          const content = await produceText(req.signal);
-          return Response.json({
-            id,
-            object: 'chat.completion',
-            created,
-            model,
-            choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: 'stop' }],
-            usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-          });
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          return new Response(JSON.stringify({ error: { message } }), {
-            status: req.signal.aborted ? 499 : 500,
-            headers: { 'content-type': 'application/json' },
-          });
-        }
+      let text: string;
+      if (kind === 'title') {
+        text = makeDirectTitle(extractLastOpenAiUserText(body.messages));
+      } else if (kind === 'compaction') {
+        const last = extractLastOpenAiUserText(body.messages);
+        text = last ? `Tutor session checkpoint: ${last.slice(0, 200)}` : 'Tutor session summary.';
+      } else {
+        text =
+          (sessionID ? args.consumePendingText(sessionID) : undefined) ??
+          'Tell me which app you want to learn or ask where a control is, and I will point right at it.';
       }
 
-      const abortController = new AbortController();
-      const onReqAbort = () => abortController.abort(req.signal.reason);
-      req.signal.addEventListener('abort', onReqAbort, { once: true });
+      const zeroUsage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+      if (!streamRequested) {
+        return Response.json({
+          id,
+          object: 'chat.completion',
+          created,
+          model,
+          choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' }],
+          usage: zeroUsage,
+        });
+      }
 
       const stream = new ReadableStream<Uint8Array>({
-        async start(controller) {
-          try {
-            controller.enqueue(encoder.encode(sseChunk(id, created, model, { role: 'assistant', content: '' }, null)));
-            const text = await produceText(abortController.signal);
-            if (abortController.signal.aborted) return;
-            controller.enqueue(encoder.encode(sseChunk(id, created, model, { content: text }, null)));
-            controller.enqueue(
-              encoder.encode(
-                sseChunk(id, created, model, {}, 'stop', { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 })
-              )
-            );
-            controller.enqueue(encoder.encode('data: [DONE]\n\n'));
-            controller.close();
-          } catch (error) {
-            if (abortController.signal.aborted) {
-              try {
-                controller.close();
-              } catch {}
-              return;
-            }
-            const message = error instanceof Error ? error.message : String(error);
-            try {
-              controller.enqueue(encoder.encode(sseChunk(id, created, model, { content: `Tutor error: ${message}` }, null)));
-              controller.enqueue(
-                encoder.encode(
-                  sseChunk(id, created, model, {}, 'stop', { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 })
-                )
-              );
-              controller.enqueue(encoder.encode('data: [DONE]\n\n'));
-              controller.close();
-            } catch {}
-          } finally {
-            req.signal.removeEventListener('abort', onReqAbort);
-          }
-        },
-        cancel() {
-          abortController.abort(new Error('Stream cancelled'));
-          req.signal.removeEventListener('abort', onReqAbort);
+        start(controller) {
+          controller.enqueue(encoder.encode(sseChunk(id, created, model, { role: 'assistant', content: '' }, null)));
+          if (text) controller.enqueue(encoder.encode(sseChunk(id, created, model, { content: text }, null)));
+          controller.enqueue(encoder.encode(sseChunk(id, created, model, {}, 'stop', zeroUsage)));
+          controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+          controller.close();
         },
       });
 
@@ -666,7 +557,6 @@ export function startDirectServer(args: {
     baseURL: `http://127.0.0.1:${port}/v1`,
     token,
     port,
-    sessionApps,
     close: () => {
       server.stop(true);
     },

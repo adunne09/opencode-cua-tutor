@@ -1,51 +1,39 @@
 /**
- * OpenCode V2 plugin: computer-use tutor mode for any macOS app. Add it to your OpenCode config;
- * nothing else to run (plugins hot reload).
+ * OpenCode V2 plugin: macOS computer-use Tutor (`cua-tutor/tutor`).
  *
- * While the plugin is active it:
- * 1. registers the tool `tutor_highlight({ step, app?, visualCue? })` in every session: Cua Driver
- *    reads the accessibility tree of the app you're in (frontmost by default), TypeSafe Jev picks
- *    the control using Companion Nouls + clean Choice (or falls back to Coarse-to-Fine Tile -> Zoom
- *    Box for unnamed controls and canvas items), and the Cua agent cursor glides to it. Never clicks.
- * 2. registers the direct System-1 virtual model `Tutor` (`cua-tutor/tutor`) via `ctx.provider.transform`:
- *    select it in any OpenCode client (Desktop, TUI, Web, Mobile) to send plain text straight to
- *    Jev with zero System-2 inference, escalating only on System-1 misses (`reobserve`/`abstain`/
- *    `unsure`/`partial`) to the configured System-2 fallback model (default `opencode-go/glm-5.3-flash#high`).
- * 3. injects tutor guidance into normal System-2 agent loops (`session.hook("context")`), so the
- *    agent points by default and only operates apps when asked. No AGENTS.md needed.
- * 4. declares the `cua-driver` MCP server (`ctx.mcp.transform`), unless you already defined one,
- *    for when you ask the agent to do things for you.
- *
- * API: anomalyco/opencode services/site/src/docs/content/build/plugins/server.mdx
+ * ZERO footprint outside the `Tutor` model:
+ * - Registers the `CUA Tutor` provider (`cua-tutor`) with ONE visible model (`cua-tutor/tutor`,
+ *   displayed as "Tutor") and ONE hidden fallback model (`cua-tutor/fallback`, cloned from
+ *   `config.fallbackModel`, default `opencode-go/glm-5.3-flash#high`).
+ * - Registers `tutor_set_app` and `tutor_highlight`, then strips BOTH from `event.tools` and
+ *   injects zero guidance on every non-Tutor model via `session.hook("context")`.
+ * - When `Tutor` IS selected:
+ *   1. `experimental.model.resolve` runs a ~90 ms 4-Noul Jev Intent Gate + direct System-1
+ *      `Tutor.highlight` on visible UI requests when an app is already selected (served via
+ *      `aisdk.hook("language")` with ZERO System-2 tokens).
+ *   2. On conceptual questions, app setup/switching, web research, System-1 misses, or tool-loop
+ *      continuations, `experimental.model.resolve` routes natively to `cua-tutor/fallback` for a
+ *      full OpenCode agent loop (`tutor_set_app`, `tutor_highlight`, `websearch`, `webfetch`, etc.).
+ *   3. `tutor_highlight` is hard-gated on `tutor_set_app` (session app must be set first), and
+ *      `tutor_set_app` validates installed macOS `.app` bundles + auto-launches if closed.
  */
 import { Model, Plugin, Provider } from '@opencode/plugin';
 
 import { loadConfig } from './config.js';
 import {
+  buildTutorGuidance,
+  decideTutorRoute,
+  DIRECT_FALLBACK_MODEL_ID,
   DIRECT_MODEL_ID,
   DIRECT_MODEL_NAME,
   DIRECT_PROVIDER_ID,
   makeDirectTitle,
-  startDirectServer,
-  type DirectServer,
+  startReplyServer,
+  type ReplyServer,
+  type TutorTurnState,
 } from './direct.js';
 import { liveIntentClassifier } from './jev.js';
 import { Tutor, TUTOR_REVISION, type HighlightResult } from './tutor.js';
-
-export const GUIDANCE = [
-  'Tutor mode is on. The user is LEARNING to use apps on this Mac and wants to do the clicking themselves.',
-  '- When they ask how or where to do something in an app, call `tutor_highlight` with ONE concrete step.',
-  '  It moves an on-screen pointer to the control (including unlabeled icons or canvas elements) in that app;',
-  '  it never clicks. Pass `app` when they name the app or it is clear from context; otherwise it uses the',
-  '  frontmost app. When you know what an unlabeled icon or canvas target looks like, pass a short concrete',
-  '  `visualCue` (e.g. "upload arrow icon in top-right header" or "clip labeled Intro.mp4 on track 1").',
-  '  Then tell them in one or two short sentences what to click and why, and wait for them to do it before',
-  '  highlighting the next step.',
-  '- For a multi-step task, plan the steps, then highlight them one at a time.',
-  "- If the tool says the control is not on screen, tell them what to open first (menu, panel, tab) and highlight that.",
-  '- Only operate apps yourself (cua-driver or other tools) when they explicitly ask you to do it for them.',
-  '- Never delete, overwrite, send, or export over their files without asking first.',
-].join('\n');
 
 export const format = (r: HighlightResult) => {
   const comp = r.selection?.companion
@@ -88,7 +76,13 @@ export default Plugin.define({
   async setup(ctx) {
     const options = (ctx.options ?? {}) as Record<string, unknown>;
     const config = loadConfig(options);
+
     const tutors = new Map<string, Tutor>();
+    const sessionApps = new Map<string, string>();
+    const tutorTurns = new Map<string, TutorTurnState>();
+    let hasFallbackModel = false;
+    let replyServer: ReplyServer | undefined;
+
     const getTutor = (sessionID: string) => {
       let tutor = tutors.get(sessionID);
       if (!tutor) {
@@ -98,18 +92,64 @@ export default Plugin.define({
       return tutor;
     };
 
-    let directServer: DirectServer | undefined;
+    const currentAppFor = (sessionID: string) => sessionApps.get(sessionID) ?? config.defaultApp;
 
+    const providerID = Provider.ID.make(DIRECT_PROVIDER_ID);
+    const tutorModelID = Model.ID.make(DIRECT_MODEL_ID);
+    const fallbackModelID = Model.ID.make(DIRECT_FALLBACK_MODEL_ID);
+    const fallbackRef = config.fallbackModel;
+
+    // 1. Register `tutor_set_app` and `tutor_highlight` (strictly hidden on all non-Tutor models below)
     await ctx.tool.transform((editor) => {
       editor.namespace({
         name: 'tutor',
-        description: 'Teach the user an app by pointing at controls instead of clicking them',
+        description: 'Teach the user a macOS app by setting the active app and pointing at controls (never clicks)',
       });
+
+      editor.add({
+        name: 'set_app',
+        description:
+          'Set the current macOS application the user is working in for this Tutor session. ' +
+          'MUST be called before `tutor_highlight` can be used. Validates against installed macOS apps' +
+          (config.autoLaunch ? ' and automatically launches the app if it is not open yet.' : '.') +
+          ' Only call this when the user explicitly names or switches the app they are learning — never on comparison mentions.',
+        input: {
+          type: 'object',
+          properties: {
+            app: {
+              type: 'string',
+              description: 'Exact macOS app name or bundle id the user wants to learn, e.g. "FilmCraft", "Keynote", or "Finder".',
+            },
+          },
+          required: ['app'],
+          additionalProperties: false,
+        },
+        options: { namespace: 'tutor', codemode: false },
+        execute: async (input, context) => {
+          if (!tutorTurns.has(context.sessionID)) {
+            return { content: 'Tutor tools are only active when the Tutor model is selected.' };
+          }
+          const { app } = input as { app: string };
+          const tutor = getTutor(context.sessionID);
+          try {
+            const res = await tutor.setApp(app, context.signal);
+            context.signal.throwIfAborted();
+            if (res.ok && res.appName) {
+              sessionApps.set(context.sessionID, res.appName);
+            }
+            return { content: res.message };
+          } catch (error) {
+            context.signal.throwIfAborted();
+            return { content: `Tutor error: ${(error as Error).message}` };
+          }
+        },
+      });
+
       editor.add({
         name: 'highlight',
         description:
-          'Point the on-screen agent cursor at the control or canvas item the user should click next to do one step in an app. ' +
-          'It NEVER clicks; the user clicks. Use it whenever the user asks how or where to do something in an app. ' +
+          'Point the on-screen agent cursor at ONE currently-visible control or canvas item in the session’s current app. ' +
+          'It NEVER clicks; the user clicks. Requires `tutor_set_app` to have been called first for this session. ' +
           `Tutor revision: ${TUTOR_REVISION}.`,
         input: {
           type: 'object',
@@ -117,10 +157,6 @@ export default Plugin.define({
             step: {
               type: 'string',
               description: 'The one next step in plain words, e.g. "open the export dialog" or "switch to the razor tool"',
-            },
-            app: {
-              type: 'string',
-              description: 'Optional app name or bundle id, e.g. "Keynote" or "com.apple.Notes". Defaults to the frontmost app.',
             },
             visualCue: {
               type: 'string',
@@ -133,11 +169,22 @@ export default Plugin.define({
         },
         options: { namespace: 'tutor', codemode: false },
         execute: async (input, context) => {
-          const { step, app, visualCue } = input as { step: string; app?: string; visualCue?: string };
+          if (!tutorTurns.has(context.sessionID)) {
+            return { content: 'Tutor tools are only active when the Tutor model is selected.' };
+          }
+          const targetApp = currentAppFor(context.sessionID);
+          if (!targetApp) {
+            return {
+              content:
+                'No current application is set for this session. Ask the user which macOS app they want to work in, then call `tutor_set_app` first.',
+            };
+          }
+          const { step, visualCue } = input as { step: string; visualCue?: string };
           const tutor = getTutor(context.sessionID);
           try {
-            const result = await tutor.highlight(step, app, context.signal, visualCue);
+            const result = await tutor.highlight(step, targetApp, context.signal, visualCue);
             context.signal.throwIfAborted();
+            if (result.ok && result.app) sessionApps.set(context.sessionID, result.app);
             return { content: format(result) };
           } catch (error) {
             context.signal.throwIfAborted();
@@ -147,63 +194,88 @@ export default Plugin.define({
       });
     });
 
+    // 2. Register `CUA Tutor` (`cua-tutor`) provider with visible `cua-tutor/tutor` + hidden `cua-tutor/fallback`
     if (config.directModel) {
-      const fallbackModel = config.fallbackModel;
-      const fallback = fallbackModel
-        ? async (prompt: string, signal?: AbortSignal) => {
-            const res = await ctx.experimental.generate.text(
-              { model: fallbackModel, prompt },
-              signal ? { signal } : undefined
-            );
-            return res.text;
-          }
-        : undefined;
-
-      const intentClassifier =
-        config.provider === 'live' ? liveIntentClassifier(config.jevModel ?? config.boxModel) : undefined;
-      directServer = startDirectServer({
-        getTutor,
-        defaultApp: config.defaultApp,
-        intentClassifier,
-        fallback,
-        fallbackModel,
-      });
-
-      const providerID = Provider.ID.make(DIRECT_PROVIDER_ID);
-      const modelID = Model.ID.make(DIRECT_MODEL_ID);
-      const baseModel = Model.Info.default(providerID, modelID);
-      const tutorModel: Model.Info = {
-        ...baseModel,
-        name: DIRECT_MODEL_NAME,
-        capabilities: {
-          ...baseModel.capabilities,
-          tools: false,
-          input: ['text'],
-          output: ['text'],
+      replyServer = startReplyServer({
+        consumePendingText: (sessionID) => {
+          const turn = tutorTurns.get(sessionID);
+          if (!turn?.pendingText) return undefined;
+          const text = turn.pendingText;
+          turn.pendingText = undefined;
+          return text;
         },
-      };
+      });
+      const replyBaseURL = replyServer.baseURL;
+      const replyToken = replyServer.token;
 
-      const baseURL = directServer.baseURL;
-      const authHeader = `Bearer ${directServer.token}`;
       await ctx.provider.transform((editor) => {
+        const source = fallbackRef ? editor.get(fallbackRef.providerID) : undefined;
+        const sourceModel = source && fallbackRef ? source.models.get(fallbackRef.id) : undefined;
+        hasFallbackModel = Boolean(source && sourceModel);
+
+        const baseTutor = Model.Info.default(providerID, tutorModelID);
+        const tutorModel: Model.Info = {
+          ...baseTutor,
+          name: DIRECT_MODEL_NAME,
+          enabled: true,
+          package: '@opencode/ai/providers/openai-compatible',
+          settings: { baseURL: replyBaseURL, apiKey: false },
+          headers: { 'x-tutor-token': replyToken },
+          ...(sourceModel
+            ? {
+                limit: sourceModel.limit,
+                capabilities: { ...sourceModel.capabilities, tools: true },
+              }
+            : {
+                capabilities: { ...baseTutor.capabilities, tools: false, input: ['text'], output: ['text'] },
+              }),
+        };
+
+        const models: Model.Info[] = [tutorModel];
+        if (source && sourceModel) {
+          models.push({
+            ...sourceModel,
+            id: fallbackModelID,
+            providerID,
+            package: sourceModel.package ?? source.provider.package,
+            name: `${sourceModel.name} (Tutor Fallback)`,
+            enabled: false, // Hidden from picker; routed to internally via experimental.model.resolve
+          });
+        }
+
+        const providerInfo: Provider.Info = source
+          ? {
+              ...source.provider,
+              id: providerID,
+              canonical: source.provider.canonical ?? source.provider.id,
+              name: 'CUA Tutor',
+              activation: 'enabled',
+            }
+          : {
+              ...Provider.Info.empty(providerID),
+              name: 'CUA Tutor',
+              activation: 'enabled',
+              package: '@opencode/ai/providers/openai-compatible',
+              settings: { baseURL: replyBaseURL, apiKey: false },
+              headers: { 'x-tutor-token': replyToken },
+            };
+
         editor.add({
-          info: {
-            ...Provider.Info.empty(providerID),
-            name: 'CUA Tutor',
-            activation: 'enabled',
-            package: '@opencode/ai/providers/openai-compatible',
-            settings: { baseURL, apiKey: false },
-            headers: { Authorization: authHeader },
-          },
-          models: [tutorModel],
+          info: providerInfo,
+          models,
+          ...(source?.sourceConnection ? { sourceConnection: source.sourceConnection } : {}),
         });
       });
 
       await ctx.session.hook(
         'model.request',
         (event) => {
-          event.headers['x-tutor-session-id'] = event.sessionID;
-          event.headers['x-tutor-kind'] = event.kind;
+          if (event.model.id === DIRECT_MODEL_ID) {
+            event.baseURL = replyBaseURL;
+            event.headers['x-tutor-token'] = replyToken;
+            event.headers['x-tutor-session-id'] = event.sessionID;
+            event.headers['x-tutor-kind'] = event.kind;
+          }
         },
         { providerID: DIRECT_PROVIDER_ID }
       );
@@ -223,18 +295,92 @@ export default Plugin.define({
         },
         { providerID: DIRECT_PROVIDER_ID }
       );
-    }
 
-    if (config.injectGuidance) {
-      await ctx.session.hook('context', (event) => {
-        if (event.model.providerID === DIRECT_PROVIDER_ID) return;
-        event.system.push({ type: 'text', text: GUIDANCE });
+      const intentClassifier =
+        config.provider === 'live' ? liveIntentClassifier(config.jevModel ?? config.boxModel) : undefined;
+
+      // Unscoped resolve hook: tracks whether THIS session's active turn is Tutor, and routes System 1 vs System 2.
+      await ctx.session.hook('experimental.model.resolve', async (event) => {
+        if (event.model.providerID !== DIRECT_PROVIDER_ID) {
+          tutorTurns.delete(event.sessionID);
+          return;
+        }
+        if (event.kind !== 'primary') {
+          return;
+        }
+        if (event.model.id !== DIRECT_MODEL_ID) {
+          return;
+        }
+
+        const prevTurn = tutorTurns.get(event.sessionID);
+        let messages: readonly unknown[] = [];
+        try {
+          messages = await ctx.session.context({ sessionID: event.sessionID });
+        } catch {
+          messages = [];
+        }
+
+        const decision = await decideTutorRoute({
+          messages,
+          lastRoutedUserMessageID: prevTurn?.mode === 'system2' ? prevTurn.userMessageID : undefined,
+          sessionApp: currentAppFor(event.sessionID),
+          onSessionApp: (app) => {
+            if (app) sessionApps.set(event.sessionID, app);
+            else sessionApps.delete(event.sessionID);
+          },
+          tutor: getTutor(event.sessionID),
+          intentClassifier,
+          hasFallbackModel,
+        });
+
+        if (decision.target === 'fallback' && hasFallbackModel) {
+          tutorTurns.set(event.sessionID, {
+            mode: 'system2',
+            userMessageID: decision.userMessageID,
+            miss: decision.miss,
+          });
+          event.model = {
+            providerID,
+            id: fallbackModelID,
+            ...(fallbackRef?.variant ? { variant: Model.VariantID.make(fallbackRef.variant) } : {}),
+          };
+          return;
+        }
+
+        tutorTurns.set(event.sessionID, {
+          mode: 'system1',
+          userMessageID: decision.userMessageID,
+          pendingText: decision.target === 'system1' ? decision.text : 'System-2 fallback is unavailable.',
+        });
       });
     }
 
+    // 3. Strictly isolate Tutor tools & guidance to ONLY active Tutor System-2 turns
+    await ctx.session.hook('context', (event) => {
+      const isTutorSystem2 =
+        event.model.providerID === DIRECT_PROVIDER_ID && event.model.id === DIRECT_FALLBACK_MODEL_ID;
+      if (!isTutorSystem2) {
+        delete event.tools.tutor_set_app;
+        delete event.tools.tutor_highlight;
+        return;
+      }
+      const turn = tutorTurns.get(event.sessionID);
+      if (config.injectGuidance) {
+        event.system.push({
+          type: 'text',
+          text: buildTutorGuidance({
+            sessionApp: currentAppFor(event.sessionID),
+            autoLaunch: config.autoLaunch,
+            miss: turn?.miss,
+          }),
+        });
+      }
+      if (turn?.miss) turn.miss = undefined;
+    });
+
+    // 4. Optional global cua-driver MCP (default OFF so zero tools leak outside Tutor)
     if (config.declareMcp) {
       await ctx.mcp.transform((editor) => {
-        // Respect a user-defined server with the same name.
         if (!editor.get('cua-driver')) {
           editor.set('cua-driver', { type: 'local', command: [config.driverBinary, 'mcp'] });
         }
@@ -242,9 +388,11 @@ export default Plugin.define({
     }
 
     return async () => {
-      directServer?.close();
+      replyServer?.close();
       await Promise.all([...tutors.values()].map((tutor) => tutor.close()));
       tutors.clear();
+      sessionApps.clear();
+      tutorTurns.clear();
     };
   },
 });

@@ -1,12 +1,23 @@
 # opencode-cua-tutor
 
-An OpenCode V2 plugin that helps you learn **macOS apps**. Ask "where do I export this?" (typed, or
-dictated with your usual hotkey) and the agent calls the plugin's `tutor_highlight` tool. **Cua Driver**
-reads the accessibility tree of the app you're working in, TypeSafe **Jev** selects the control using
-decomposed **Companion Nouls + clean Choice** (or falls back to **Coarse-to-Fine Tile → Zoom `Box`**
-for unlabeled icons and canvas-drawn elements), and the Cua Driver agent cursor glides to it.
-**It never clicks. You click.** When you ask the agent to do something for you, it can still drive
-the app through the `cua-driver` MCP server, which the plugin declares itself.
+An OpenCode V2 plugin that adds a **`CUA Tutor → Tutor`** (`cua-tutor/tutor`) model for learning
+**macOS apps**. Everything in the plugin is **100% isolated to the `Tutor` model**: when any other
+model is selected, zero tutor tools, zero guidance, and zero MCP servers are active or visible.
+
+Inside **`Tutor`**:
+- **System-1 fast path (0 System-2 tokens):** A ~90 ms 4-`Noul` TypeSafe Jev Intent Gate routes
+  visible UI requests directly to **Cua Driver** + **TypeSafe Jev** (Companion `Noul`s + clean
+  `Choice`, with **Coarse-to-Fine Tile → Zoom `Box`** fallback for unlabeled icons and canvas
+  items), gliding the Cua Driver agent cursor directly to the control. **It never clicks. You click.**
+- **Full native System-2 agent loop:** On app setup/switching, conceptual questions, web research,
+  or System-1 misses, `cua-tutor/tutor` routes seamlessly via `experimental.model.resolve` to a
+  hidden `cua-tutor/fallback` model (cloned from `fallbackModel`, default
+  `opencode-go/glm-5.3-flash#high`) with full OpenCode tool calling (`tutor_set_app`,
+  `tutor_highlight`, `websearch`, `webfetch`, `read`, `question`, etc.).
+- **Explicit app selection + auto-launch:** No `ignoreApps` list and no guessing from open windows.
+  `tutor_highlight` is hard-gated on `tutor_set_app` — tell `Tutor` once which app you’re working
+  in and it validates the installed macOS `.app` bundle, **automatically launches it** if closed,
+  and remembers it for the rest of the session.
 
 Nothing to launch: it works in your normal OpenCode, including the background service. Watched
 configuration/plugin changes reload automatically; external local dependencies may not be watched.
@@ -33,14 +44,7 @@ and the plugin looks there, so PATH doesn't matter.
    ```jsonc
    {
      "$schema": "https://opencode.ai/config.json",
-     "plugins": [
-       {
-         "package": "/path/to/opencode-cua-tutor",
-         "options": {
-           "ignoreApps": ["OpenCode", "Terminal", "iTerm2", "Ghostty", "Google Chrome", "Finder"]
-         }
-       }
-     ]
+     "plugins": ["/path/to/opencode-cua-tutor"]
    }
    ```
 
@@ -49,50 +53,53 @@ and the plugin looks there, so PATH doesn't matter.
    server process has to see the variable. Without a key the tool reports unavailable.
    `provider: "mock"` explicitly enables a development-only word matcher; results identify it.
 
-## Direct Tutor Mode (`Tutor` model — System 1 first, System 2 only on miss)
+## Direct Tutor Mode (`CUA Tutor → Tutor` — System 1 first, native System-2 agent loop on fallback)
 
-The plugin also registers a virtual chat model **`Tutor`** (`cua-tutor/tutor`) directly in OpenCode's
-normal model picker (works in Desktop, TUI, Web, and Mobile — no UI extensions needed):
+The plugin registers the **`CUA Tutor`** provider (`cua-tutor`) with one visible model in OpenCode's
+picker (**`Tutor`**, `cua-tutor/tutor`) and one hidden fallback model (`cua-tutor/fallback`, cloned
+from `fallbackModel`, default **`opencode-go/glm-5.3-flash#high`**):
 
-1. Select **`Tutor`** in the model picker and talk normally — mention the app once at the start
-   (e.g. *"I'm trying to learn FilmCraft today"*) or just open it and ask; the plugin remembers the
-   active app for the rest of the session (and recovers automatically if you close it or switch apps).
-2. **Jev Intent Gate (~90 ms, 4 parallel atomic `Noul`s, 0 screenshots):**
-   - `explicit_do_for_me` → instant point-only notice (switch to a full model when you want the AI to click or run tools).
-   - `is_conceptual_or_chat` (and not a UI control request) → skips screen observation completely and
-     goes straight to `fallbackModel` (default **`opencode-go/glm-5.3-flash#high`**) with your remembered
-     session app in context.
-   - `wants_ui_pointer` → runs `CuaDriver + TypeSafe Jev` directly with **zero System-2 inference** and
-     points immediately.
-3. **Automatic System-2 fallback on UI miss:** If System 1 returns `reobserve`, `abstain`, `unsure`,
-   or `partial` (e.g. a setting hidden behind an unopened tab/menu), it escalates *only that turn* to
-   **`opencode-go/glm-5.3-flash#high`**, and immediately highlights any concrete visible prerequisite
-   step it suggests.
+1. Select **`CUA Tutor → Tutor`** in the model picker (works in Desktop, TUI, Web, and Mobile).
+2. Mention the app once at the start (e.g. *"I'm trying to learn FilmCraft today"*). System 2 calls
+   **`tutor_set_app({ app })`**, which resolves the verified installed macOS `.app` bundle,
+   **automatically launches it** if closed (`autoLaunch: true` by default), and remembers it for
+   the rest of the session.
+3. **Jev Intent Gate (~90 ms, 4 parallel atomic `Noul`s, 0 screenshots):**
+   - `explicit_do_for_me` → instant point-only notice (`0` LLM tokens, `0` screenshots).
+   - `is_conceptual_or_chat` (or no app set yet) → routes natively to `cua-tutor/fallback` for a
+     full OpenCode tool-calling loop (`tutor_set_app`, `websearch`, `webfetch`, `read`, `question`, etc.).
+   - `wants_ui_pointer` (once an app is set) → runs `CuaDriver + TypeSafe Jev` directly with
+     **zero System-2 tokens** and points immediately.
+4. **Automatic System-2 escalation on UI miss:** If System 1 returns `reobserve`, `abstain`,
+   `unsure`, or `partial` (e.g. a setting hidden behind an unopened tab/menu), it routes that turn
+   to `cua-tutor/fallback` with the System-1 miss diagnostics injected into context so System 2 can
+   coach you, search docs, or call `tutor_highlight` on the visible prerequisite control.
 
-## The tool
+## Tutor Tools (visible ONLY when `Tutor` is selected)
 
 ```ts
-tutor_highlight({ step: string, app?: string, visualCue?: string })
+tutor_set_app({ app: string })
+tutor_highlight({ step: string, visualCue?: string })
 ```
 
-- `step`: one concrete next step, e.g. `"open the export dialog"` or `"select the Aurora Timelapse clip"`.
-- `app`: optional app name or bundle id (`"FilmCraft"`, `"com.apple.Notes"`). Without it the tutor
-  uses the system-frontmost app, skipping apps where you talk to the agent (OpenCode and terminals;
-  customize via `ignoreApps`), falling back to the top on-screen window of any other app.
-- `visualCue`: optional concrete visual description of an unlabeled icon or canvas target
-  (e.g. `"upload arrow icon in top-right header"`). Used only if visual `Box` fallback runs.
-
-Example: with [FilmCraft](https://github.com/storytold/filmcraft) open behind your terminal,
-"how do I split this clip?" → `tutor_highlight({ step: "switch to the razor tool", app: "FilmCraft" })`
-→ the agent cursor points at the Razor tool and the agent tells you to click it.
+- `tutor_set_app`: sets the session's active macOS app (`"FilmCraft"`, `"Keynote"`, `"Finder"`).
+  Validates strictly against installed macOS `.app` bundles (`/Applications`, `~/Applications`,
+  `/System/Applications`) and launches it automatically when closed (`autoLaunch: true`). Must be
+  called before `tutor_highlight` can run.
+- `tutor_highlight`: points the on-screen agent cursor at one currently-visible control or canvas
+  item in the session's active app (never clicks). Refuses to run until `tutor_set_app` has set an
+  app — never guesses from open windows.
+- Both tools (and all Tutor guidance) are stripped via `session.hook("context")` whenever any model
+  other than `cua-tutor/tutor` is active.
 
 ## What the plugin adds (OpenCode V2 API)
 
 | Mechanism | What |
 | --- | --- |
-| `ctx.tool.transform` | Tool `tutor_highlight` in every session: `{ step, app? }` → point, never click |
-| `ctx.session.hook("context")` | Adds app-agnostic tutor guidance to every agent-loop system prompt: highlight one step at a time, wait for you, only act when asked. Turn it off with `"injectGuidance": false` |
-| `ctx.mcp.transform` | Declares the `cua-driver` MCP server (`~/.local/bin/cua-driver mcp`) unless you already defined one. Turn it off with `"declareMcp": false` |
+| `ctx.provider.transform` | Registers `CUA Tutor` (`cua-tutor`) with visible `cua-tutor/tutor` and hidden `cua-tutor/fallback` (cloned from `fallbackModel`) |
+| `ctx.session.hook("experimental.model.resolve")` | Routes `cua-tutor/tutor` turns between System 1 (zero LLM tokens) and native `cua-tutor/fallback` (full OpenCode tool loop) |
+| `ctx.tool.transform` + `ctx.session.hook("context")` | Exposes `tutor_set_app` and `tutor_highlight` + dynamic Tutor guidance **only** to `Tutor` sessions; strips both on every other model |
+| `ctx.mcp.transform` | Optional `cua-driver` MCP declaration (`declareMcp: false` by default so zero tools leak outside `Tutor`) |
 
 ## How Jev picks targets (Text-AX first, Coarse-to-Fine `Box` fallback)
 
@@ -173,8 +180,7 @@ back the same point.
   {
     "package": "/path/to/opencode-cua-tutor",
     "options": {
-      "deadlineMs": 15000,
-      "ignoreApps": ["OpenCode", "Terminal", "Ghostty", "Google Chrome", "Finder"]
+      "deadlineMs": 15000
     }
   }
 ]
@@ -182,12 +188,12 @@ back the same point.
 
 | Option | Env | Default |
 | --- | --- | --- |
-| `app` | `CUA_TUTOR_APP` | unset (frontmost non-ignored app) |
-| `ignoreApps` (array or comma list) | `CUA_TUTOR_IGNORE_APPS` | OpenCode, Terminal, iTerm2, Ghostty, WezTerm, Alacritty, kitty, Warp |
+| `app` | `CUA_TUTOR_APP` | unset (must be specified by the user/session) |
 | `provider` (`live`/`mock`) | `CUA_TUTOR_PROVIDER` | `live`; mock must be explicit; typos are errors |
 | `jevModel` | `CUA_TUTOR_JEV_MODEL` | SDK default |
-| `directModel` | `CUA_TUTOR_DIRECT_MODEL` | `true` (register the `Tutor` / `cua-tutor/tutor` direct System-1 virtual model) |
-| `fallbackModel` | `CUA_TUTOR_FALLBACK_MODEL` | `opencode-go/glm-5.3-flash#high` (System-2 fallback on System-1 miss; `"none"` / `false` disables) |
+| `directModel` | `CUA_TUTOR_DIRECT_MODEL` | `true` (register the `CUA Tutor → Tutor` router model) |
+| `fallbackModel` | `CUA_TUTOR_FALLBACK_MODEL` | `opencode-go/glm-5.3-flash#high` (cloned as hidden `cua-tutor/fallback`; `"none"` / `false` disables) |
+| `autoLaunch` | `CUA_TUTOR_AUTO_LAUNCH` | `true` (automatically launch verified installed macOS `.app` bundles when selected & closed) |
 | `visual` | `CUA_TUTOR_VISUAL` | `true` (enable Coarse-to-Fine `Box` visual fallback) |
 | `boxModel` | `CUA_TUTOR_BOX_MODEL` | `jev-1.14.0` (model for visual `Box` + tile/verify `Noul` calls) |
 | `verifyBox` | `CUA_TUTOR_VERIFY_BOX` | `true` (3-`Noul` red-box self-verification after `Box` localization) |
@@ -197,7 +203,7 @@ back the same point.
 | `maxRequests` / `concurrency` | `CUA_TUTOR_MAX_REQUESTS` / `CUA_TUTOR_CONCURRENCY` | `12` / `3`; SDK automatic retries disabled |
 | `driverBinary` | `CUA_DRIVER_BIN` | `~/.local/bin/cua-driver`, `/usr/local/bin/cua-driver`, else `cua-driver` on PATH |
 | `driverSession` | `CUA_TUTOR_DRIVER_SESSION` | `cua-tutor` prefix; each session gets an isolated random suffix |
-| `injectGuidance`, `declareMcp` | | `true` |
+| `injectGuidance`, `declareMcp` | | `injectGuidance: true` (Tutor-only), `declareMcp: false` |
 
 ## Safety
 
@@ -226,7 +232,6 @@ back the same point.
 ```sh
 bun test                                                  # unit tests + end-to-end against a fake cua-driver MCP server
 bun run typecheck                                         # tsc --noEmit
-bun bin/tutor.ts "open the export dialog"                 # one highlight in the frontmost app
 bun bin/tutor.ts --app FilmCraft "switch to the razor tool"
 bun bin/tutor.ts --verify --app Finder "create a new folder"   # + agent-cursor readback and driver calls
 EVAL_OUT=/tmp/eval.png bun scripts/eval-snapshot.ts --app FilmCraft "lock track V1" "play the timeline"
