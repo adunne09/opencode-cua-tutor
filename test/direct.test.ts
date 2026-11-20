@@ -100,6 +100,9 @@ describe('Direct Tutor config and message inspection', () => {
     expect(cont.isContinuation).toBe(true);
 
     expect(makeDirectTitle('@FilmCraft switch to the razor tool')).toBe('FilmCraft: switch to the razor tool');
+    expect(
+      makeDirectTitle('Here is the first message of the conversation:\n\n<message>\ni want to learn filmcraft\n</message>\n\nReply with only the title.')
+    ).toBe('i want to learn filmcraft');
   });
 });
 

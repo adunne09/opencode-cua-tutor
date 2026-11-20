@@ -134,7 +134,8 @@ export function parseDirectInput(raw: string): { app?: string; step: string } {
 
 /** Generate a short instant session title without invoking any LLM. */
 export function makeDirectTitle(raw: string): string {
-  const { app, step } = parseDirectInput(raw);
+  // OpenCode's title request wraps the first user message in `<message>` tags.
+  const { app, step } = parseDirectInput(raw.match(/<message>\s*([\s\S]*?)\s*<\/message>/)?.[1] ?? raw);
   const clean = step.replace(/\s+/g, ' ').trim();
   if (!clean) return app ? `${app} Tutor` : 'Tutor Session';
   const short = clean.length > 44 ? `${clean.slice(0, 43).trimEnd()}…` : clean;
