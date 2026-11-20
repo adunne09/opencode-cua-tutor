@@ -11,8 +11,8 @@ Inside **`Tutor`**:
   items), gliding the Cua Driver agent cursor directly to the control. **It never clicks. You click.**
 - **Full native System-2 agent loop:** On app setup/switching, conceptual questions, web research,
   or System-1 misses, `cua-tutor/tutor` routes seamlessly via `experimental.model.resolve` to a
-  hidden `cua-tutor/fallback` model (cloned from `fallbackModel`, default
-  `opencode-go/glm-5.3-flash#high`) with full OpenCode tool calling (`tutor_set_app`,
+  hidden `cua-tutor/fallback` model (cloned from the model you set as `fallbackModel`) with full
+  OpenCode tool calling (`tutor_set_app`,
   `tutor_highlight`, `websearch`, `webfetch`, `read`, `question`, etc.).
 - **Explicit app selection + auto-launch:** No `ignoreApps` list and no guessing from open windows.
   `tutor_highlight` is hard-gated on `tutor_set_app` — tell `Tutor` once which app you’re working
@@ -38,15 +38,30 @@ and the plugin looks there, so PATH doesn't matter.
 ## Install
 
 1. Install the plugin's dependencies once: `cd /path/to/opencode-cua-tutor && bun install`
-2. Add the plugin to your global OpenCode config, `~/.config/opencode/opencode.jsonc`. Keep the
-   keys you already have:
+2. Add the plugin to your global OpenCode config, `~/.config/opencode/opencode.jsonc`, with a
+   `fallbackModel`. Keep the keys you already have:
 
    ```jsonc
    {
      "$schema": "https://opencode.ai/config.json",
-     "plugins": ["/path/to/opencode-cua-tutor"]
+     "plugins": [
+       {
+         "package": "/path/to/opencode-cua-tutor",
+         "options": {
+           "fallbackModel": "opencode-go/glm-5.3-flash#high"
+         }
+       }
+     ]
    }
    ```
+
+   `fallbackModel` is required and has no default. It is the model `Tutor` hands a turn to when
+   it can't just point at a control: setting up the app, conceptual questions, web research, and
+   System-1 misses. Use any `provider/model` or `provider/model#variant` you can already use in
+   OpenCode, including providers defined in your own `opencode.json(c)`; the fallback uses that
+   provider's credentials. The `CUA_TUTOR_FALLBACK_MODEL` environment variable also works. Without
+   it, the plugin fails to load with an error naming the option. `"none"` runs `Tutor` without
+   System 2 (it then only points, and can't call `tutor_set_app`, so pin `app` too).
 
 3. Give the OpenCode server your Jev key as `TYPESAFE_API_KEY`
    (<https://console.typesafe.ai/keys>; $0.042 per 1M input tokens, output free). The OpenCode
@@ -57,7 +72,7 @@ and the plugin looks there, so PATH doesn't matter.
 
 The plugin registers the **`CUA Tutor`** provider (`cua-tutor`) with one visible model in OpenCode's
 picker (**`Tutor`**, `cua-tutor/tutor`) and one hidden fallback model (`cua-tutor/fallback`, cloned
-from `fallbackModel`, default **`opencode-go/glm-5.3-flash#high`**):
+from your required **`fallbackModel`**):
 
 1. Select **`CUA Tutor → Tutor`** in the model picker (works in Desktop, TUI, Web, and Mobile).
 2. Mention the app once at the start (e.g. *"I'm trying to learn FilmCraft today"*). System 2 calls
@@ -180,6 +195,7 @@ back the same point.
   {
     "package": "/path/to/opencode-cua-tutor",
     "options": {
+      "fallbackModel": "opencode-go/glm-5.3-flash#high",
       "deadlineMs": 15000
     }
   }
@@ -192,7 +208,7 @@ back the same point.
 | `provider` (`live`/`mock`) | `CUA_TUTOR_PROVIDER` | `live`; mock must be explicit; typos are errors |
 | `jevModel` | `CUA_TUTOR_JEV_MODEL` | SDK default |
 | `directModel` | `CUA_TUTOR_DIRECT_MODEL` | `true` (register the `CUA Tutor → Tutor` router model) |
-| `fallbackModel` | `CUA_TUTOR_FALLBACK_MODEL` | `opencode-go/glm-5.3-flash#high` (any `provider/model#variant`, including providers defined in `opencode.json(c)`; cloned as hidden `cua-tutor/fallback`; `"none"` / `false` disables) |
+| `fallbackModel` | `CUA_TUTOR_FALLBACK_MODEL` | **Required, no default** while `directModel` is on. Any `provider/model#variant`, including providers defined in `opencode.json(c)`; cloned as hidden `cua-tutor/fallback`; `"none"` / `false` explicitly disables System 2 |
 | `autoLaunch` | `CUA_TUTOR_AUTO_LAUNCH` | `true` (automatically launch verified installed macOS `.app` bundles when selected & closed) |
 | `visual` | `CUA_TUTOR_VISUAL` | `true` (enable Coarse-to-Fine `Box` visual fallback) |
 | `boxModel` | `CUA_TUTOR_BOX_MODEL` | `jev-1.14.0` (model for visual `Box` + tile/verify `Noul` calls) |

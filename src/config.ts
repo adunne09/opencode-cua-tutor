@@ -9,9 +9,6 @@ export type ModelRef = {
   variant?: string;
 };
 
-/** Default System-2 fallback when Direct Tutor Mode (`cua-tutor/tutor`) misses on System 1. */
-export const DEFAULT_FALLBACK_MODEL = 'opencode-go/glm-5.3-flash#high';
-
 /** Parse `"provider/model#variant"` or `{ providerID, id, variant? }`; `"none"` / `"false"` / `false` disables. */
 export function parseModelRef(value: unknown): ModelRef | undefined {
   if (value === false || value === null || value === undefined) return undefined;
@@ -75,7 +72,7 @@ export type TutorConfig = {
   locateModel: string;
   /** Register the direct System-1 virtual model `Tutor` (`cua-tutor/tutor`) in OpenCode's model picker. */
   directModel: boolean;
-  /** Optional System-2 fallback model invoked when `Tutor` routes to System 2 (conceptual, setup, or System-1 miss). */
+  /** System-2 model invoked when `Tutor` routes to System 2 (conceptual, setup, or System-1 miss). No default; see `assertFallbackModelConfigured`. */
   fallbackModel?: ModelRef;
   /** Automatically launch an installed macOS `.app` bundle when the selected app is not open yet. */
   autoLaunch: boolean;
@@ -97,6 +94,15 @@ export function resolveDriverBinary(explicit: unknown, home = homedir()): string
     if (existsSync(candidate)) return candidate;
   }
   return 'cua-driver';
+}
+
+/** The `Tutor` router has no built-in System-2 model, so the plugin must be told which one to use. */
+export function assertFallbackModelConfigured(options: Record<string, unknown> = {}, env: NodeJS.ProcessEnv = process.env) {
+  if ((options.fallbackModel ?? env.CUA_TUTOR_FALLBACK_MODEL) !== undefined) return;
+  throw new Error(
+    'CUA Tutor requires the `fallbackModel` plugin option (or CUA_TUTOR_FALLBACK_MODEL), e.g. "opencode-go/glm-5.3-flash#high". ' +
+      'Use "none" to run without System 2, or set `directModel: false` to skip the Tutor model.'
+  );
 }
 
 export function loadConfig(options: Record<string, unknown> = {}, env: NodeJS.ProcessEnv = process.env): TutorConfig {
@@ -128,7 +134,7 @@ export function loadConfig(options: Record<string, unknown> = {}, env: NodeJS.Pr
     locate: !['0', 'false', 'off'].includes(String(pick('locate', 'CUA_TUTOR_LOCATE') ?? 'false').toLowerCase()),
     locateModel: String(pick('locateModel', 'CUA_TUTOR_LOCATE_MODEL') ?? 'jev-1.14.0'),
     directModel: !['0', 'false', 'off'].includes(String(pick('directModel', 'CUA_TUTOR_DIRECT_MODEL') ?? 'true').toLowerCase()),
-    fallbackModel: parseModelRef(pick('fallbackModel', 'CUA_TUTOR_FALLBACK_MODEL') ?? DEFAULT_FALLBACK_MODEL),
+    fallbackModel: parseModelRef(pick('fallbackModel', 'CUA_TUTOR_FALLBACK_MODEL')),
     autoLaunch: !['0', 'false', 'off'].includes(String(pick('autoLaunch', 'CUA_TUTOR_AUTO_LAUNCH') ?? 'true').toLowerCase()),
     injectGuidance: options.injectGuidance !== false,
     declareMcp: options.declareMcp === true,

@@ -4,7 +4,7 @@
  * Architecture:
  * - The `cua-tutor` provider exposes ONE visible model in OpenCode's picker (`CUA Tutor -> Tutor`,
  *   `cua-tutor/tutor`) and ONE hidden fallback model (`cua-tutor/fallback`, cloned from the
- *   configured `fallbackModel`, default `opencode-go/glm-5.3-flash#high`).
+ *   required `fallbackModel` plugin option).
  * - On every request for `cua-tutor/tutor`, `experimental.model.resolve` runs `decideTutorRoute`:
  *   1. Tool-result / assistant continuations -> route immediately to `cua-tutor/fallback` (0 ms).
  *   2. Fresh user prompt -> ~90 ms 4-Noul Jev Intent Gate (0 screenshots):

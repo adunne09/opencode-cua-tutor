@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { gunzipSync, zstdDecompressSync } from 'node:zlib';
 
-import { DEFAULT_FALLBACK_MODEL, formatModelRef, loadConfig, parseModelRef } from '../src/config.js';
+import { assertFallbackModelConfigured, formatModelRef, loadConfig, parseModelRef } from '../src/config.js';
 import {
   buildTutorGuidance,
   decideTutorRoute,
@@ -47,13 +47,21 @@ function fakeResult(overrides: Partial<HighlightResult> = {}): HighlightResult {
 }
 
 describe('Direct Tutor config and message inspection', () => {
-  test('defaults directModel=true, autoLaunch=true, declareMcp=false, and fallbackModel=opencode-go/glm-5.3-flash#high', () => {
+  test('defaults directModel=true, autoLaunch=true, declareMcp=false, and requires an explicit fallbackModel', () => {
     const def = loadConfig({}, {});
     expect(def.directModel).toBe(true);
     expect(def.autoLaunch).toBe(true);
     expect(def.declareMcp).toBe(false);
-    expect(def.fallbackModel).toEqual({ providerID: 'opencode-go', id: 'glm-5.3-flash', variant: 'high' });
-    expect(formatModelRef(def.fallbackModel!)).toBe(DEFAULT_FALLBACK_MODEL);
+    expect(def.fallbackModel).toBeUndefined();
+    expect(() => assertFallbackModelConfigured({}, {})).toThrow(/fallbackModel/);
+    expect(() => assertFallbackModelConfigured({ fallbackModel: 'opencode-go/glm-5.3-flash#high' }, {})).not.toThrow();
+    expect(() => assertFallbackModelConfigured({}, { CUA_TUTOR_FALLBACK_MODEL: 'opencode-go/glm-5.3-flash' })).not.toThrow();
+    expect(() => assertFallbackModelConfigured({ fallbackModel: 'none' }, {})).not.toThrow();
+    expect(() => assertFallbackModelConfigured({ fallbackModel: false }, {})).not.toThrow();
+
+    const configured = loadConfig({ fallbackModel: 'accomplish/zai-org/GLM-5.3-Flash#high' }, {});
+    expect(configured.fallbackModel).toEqual({ providerID: 'accomplish', id: 'zai-org/GLM-5.3-Flash', variant: 'high' });
+    expect(formatModelRef(configured.fallbackModel!)).toBe('accomplish/zai-org/GLM-5.3-Flash#high');
 
     expect(loadConfig({ directModel: false }, {}).directModel).toBe(false);
     expect(loadConfig({ autoLaunch: false }, {}).autoLaunch).toBe(false);

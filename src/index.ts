@@ -4,7 +4,7 @@
  * ZERO footprint outside the `Tutor` model:
  * - Registers the `CUA Tutor` provider (`cua-tutor`) with ONE visible model (`cua-tutor/tutor`,
  *   displayed as "Tutor") and ONE hidden fallback model (`cua-tutor/fallback`, cloned from
- *   `config.fallbackModel`, default `opencode-go/glm-5.3-flash#high`).
+ *   the required `config.fallbackModel`).
  * - Registers `tutor_set_app` and `tutor_highlight`, then strips BOTH from `event.tools` and
  *   injects zero guidance on every non-Tutor model via `session.hook("context")`.
  * - When `Tutor` IS selected:
@@ -19,7 +19,7 @@
  */
 import { Integration, Model, Plugin, Provider } from '@opencode/plugin';
 
-import { loadConfig } from './config.js';
+import { assertFallbackModelConfigured, loadConfig } from './config.js';
 import {
   buildTutorGuidance,
   decideTutorRoute,
@@ -76,6 +76,7 @@ export default Plugin.define({
   async setup(ctx) {
     const options = (ctx.options ?? {}) as Record<string, unknown>;
     const config = loadConfig(options);
+    if (config.directModel) assertFallbackModelConfigured(options);
 
     const tutors = new Map<string, Tutor>();
     const sessionApps = new Map<string, string>();
