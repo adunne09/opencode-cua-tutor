@@ -82,7 +82,7 @@ tutor_set_app({ app: string })
 tutor_highlight({ step: string, visualCue?: string })
 ```
 
-- `tutor_set_app`: sets the session's active macOS app (`"FilmCraft"`, `"Keynote"`, `"Finder"`).
+- `tutor_set_app`: sets the session's active macOS app (`"FilmCraft"`, `"Keynote"`, `"TextEdit"`).
   Validates strictly against installed macOS `.app` bundles (`/Applications`, `~/Applications`,
   `/System/Applications`) and launches it automatically when closed (`autoLaunch: true`). Must be
   called before `tutor_highlight` can run.
@@ -233,7 +233,7 @@ back the same point.
 bun test                                                  # unit tests + end-to-end against a fake cua-driver MCP server
 bun run typecheck                                         # tsc --noEmit
 bun bin/tutor.ts --app FilmCraft "switch to the razor tool"
-bun bin/tutor.ts --verify --app Finder "create a new folder"   # + agent-cursor readback and driver calls
+bun bin/tutor.ts --verify --app TextEdit "create a new document"   # + agent-cursor readback and driver calls
 EVAL_OUT=/tmp/eval.png bun scripts/eval-snapshot.ts --app FilmCraft "lock track V1" "play the timeline"
                                                           # one snapshot, many steps, per-round Jev picks, marks drawn on the screenshot
 ```
@@ -254,4 +254,4 @@ an in-process adapter, not a Node subprocess. The SDK documents Node >=22; .7.0 
 - Freshness checks narrow the race with user interaction, but cannot make an OS overlay move
   atomic with an accessibility/screenshot read. Multi-monitor/occlusion behavior needs live validation.
 - Menu items that only exist once a menu is open aren't visible; the tool points at the menu
-  (e.g. Finder "create a new folder" → File) and the agent highlights the next step after you open it.
+  (e.g. TextEdit "create a new document" → File) and the agent highlights the next step after you open it.
