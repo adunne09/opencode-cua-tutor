@@ -2,7 +2,7 @@
 import { defaultAppLauncher, type AppLauncher } from './apps.js';
 import { axCandidates, type CandidateTable, type Rect, type TutorCandidate } from './candidates.js';
 import type { TutorConfig } from './config.js';
-import { CuaDriver, type WindowInfo } from './driver.js';
+import { CuaDriver, NoWindowError, type WindowInfo } from './driver.js';
 import {
   decide,
   inferenceContext,
@@ -83,6 +83,14 @@ function whereInWindow(p: { x: number; y: number }, bounds?: readonly number[]):
   return `${v} ${h} of the window`;
 }
 
+const driverFailure = (appName: string, error: unknown): SetAppResult => ({
+  ok: false,
+  appName,
+  open: false,
+  launched: false,
+  message: `Could not check ${appName}'s windows because Cua Driver failed: ${error instanceof Error ? error.message : String(error)}`,
+});
+
 export class Tutor {
   readonly driver: CuaDriver;
   private readonly chooser: Chooser;
@@ -112,8 +120,9 @@ export class Tutor {
       signal?.throwIfAborted();
       try {
         return await this.driver.findWindow(appName, signal);
-      } catch {
+      } catch (error) {
         signal?.throwIfAborted();
+        if (!(error instanceof NoWindowError)) throw error;
       }
       if (Date.now() >= deadline) break;
       await new Promise<void>((resolve, reject) => {
@@ -140,14 +149,16 @@ export class Tutor {
       return await this.driver.findWindow(app, signal);
     } catch (firstError) {
       signal.throwIfAborted();
-      if (!this.config.autoLaunch) throw firstError;
+      // Only a confirmed "no window" justifies launching; driver failures must surface as-is.
+      if (!(firstError instanceof NoWindowError) || !this.config.autoLaunch) throw firstError;
       const installed = this.launcher.resolve(app);
       if (!installed) throw firstError;
       if (installed.name.toLowerCase() !== app.toLowerCase()) {
         try {
           return await this.driver.findWindow(installed.name, signal);
-        } catch {
+        } catch (error) {
           signal.throwIfAborted();
+          if (!(error instanceof NoWindowError)) throw error;
         }
       }
       await this.launcher.launch(installed.path, signal);
@@ -177,8 +188,9 @@ export class Tutor {
         launched: false,
         message: `Current tutor app set to "${appName}" (already open${win.title ? ` — window "${win.title}"` : ''}).`,
       };
-    } catch {
+    } catch (error) {
       signal?.throwIfAborted();
+      if (!(error instanceof NoWindowError)) return driverFailure(query, error);
     }
 
     const installed = this.launcher.resolve(query);
@@ -205,8 +217,9 @@ export class Tutor {
           launched: false,
           message: `Current tutor app set to "${appName}" (already open${win.title ? ` — window "${win.title}"` : ''}).`,
         };
-      } catch {
+      } catch (error) {
         signal?.throwIfAborted();
+        if (!(error instanceof NoWindowError)) return driverFailure(installed.name, error);
       }
     }
 

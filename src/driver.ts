@@ -37,6 +37,13 @@ export type WindowInfo = {
 const visible = (w: WindowInfo) => w.is_on_screen !== false && w.on_current_space !== false && (w.layer ?? 0) === 0;
 const byZ = (a: WindowInfo, b: WindowInfo) => (b.z_index ?? -1) - (a.z_index ?? -1);
 
+/** The driver answered, and the app has no visible window (as opposed to the driver call failing). */
+export class NoWindowError extends Error {
+  constructor(app: string) {
+    super(`${app} has no on-screen window. Open it first.`);
+  }
+}
+
 /** The driver needs OS discovery/config, not the parent's unrelated provider credentials. */
 export function driverEnvironment(env: NodeJS.ProcessEnv = process.env): Record<string, string> {
   return Object.fromEntries(Object.entries(env).filter(([key, value]) =>
@@ -73,6 +80,12 @@ export class CuaDriver {
       this.connecting = (async () => {
         const client = new Client({ name: 'opencode-cua-tutor', version: '0.2.0' });
         const transport = new StdioClientTransport({ command: this.binary, args: ['mcp'], env: this.env });
+        // If the driver process exits, drop the dead client so the next call respawns it.
+        client.onclose = () => {
+          if (this.client !== client) return;
+          this.client = undefined;
+          this.started = false;
+        };
         try {
           await client.connect(transport, { signal, timeout: 5000 });
           if (this.closed) throw new Error('Tutor driver closed during connection');
@@ -156,7 +169,7 @@ export class CuaDriver {
   /** Frontmost on-screen window of the named app (name substring or bundle id, as list_windows matches). */
   async findWindow(app: string, signal?: AbortSignal): Promise<WindowInfo> {
     const windows = this.windowsOf(await this.call('list_windows', { app }, signal));
-    if (!windows.length) throw new Error(`${app} has no on-screen window. Open it first.`);
+    if (!windows.length) throw new NoWindowError(app);
     // Prefer an exact app-name match over a substring hit ("Notes" vs "Sticky Notes").
     const exact = windows.filter((w) => (w.app_name ?? '').toLowerCase() === app.toLowerCase());
     return (exact.length ? exact : windows).sort(byZ)[0];

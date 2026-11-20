@@ -6,7 +6,7 @@ import { TypeSafeClient, choice } from '@typesafe-ai/sdk';
 import { PNG } from 'pngjs';
 import { axCandidates, type TutorCandidate } from '../src/candidates.js';
 import { loadConfig } from '../src/config.js';
-import { CuaDriver, driverEnvironment } from '../src/driver.js';
+import { CuaDriver, NoWindowError, driverEnvironment } from '../src/driver.js';
 import { bufferedFetch, decide, inferenceContext, liveChooser, type Chooser } from '../src/jev.js';
 import { Tutor } from '../src/tutor.js';
 import { normalizeScreenshot } from '../src/visual.js';
@@ -433,6 +433,27 @@ describe('driver ownership and process lifetime', () => {
       expect(pids).toHaveLength(1);
       await driver.close();
       expect(() => process.kill(pids[0], 0)).toThrow();
+    } finally { await driver.close(); }
+  });
+  test('a driver process that exits is respawned on the next call, and missing windows stay distinguishable', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'tutor-respawn-'));
+    const pidLog = join(dir, 'pids');
+    const driver = new CuaDriver(join(import.meta.dir, 'fake-cua-driver.ts'), 'respawn', {
+      ...driverEnvironment(), FAKE_DRIVER_LOG: join(dir, 'calls'), FAKE_DRIVER_PID_LOG: pidLog,
+    });
+    try {
+      expect((await driver.findWindow('Notes')).window_id).toBe(9);
+      const [first] = readFileSync(pidLog, 'utf8').trim().split('\n').map(Number);
+      process.kill(first, 'SIGKILL');
+      for (let i = 0; i < 50; i++) {
+        try { process.kill(first, 0); } catch { break; }
+        await Bun.sleep(20);
+      }
+      await Bun.sleep(50);
+      expect((await driver.findWindow('Notes')).window_id).toBe(9);
+      const pids = readFileSync(pidLog, 'utf8').trim().split('\n').map(Number);
+      expect(pids).toHaveLength(2);
+      await expect(driver.findWindow('NoSuchApp')).rejects.toBeInstanceOf(NoWindowError);
     } finally { await driver.close(); }
   });
   test('close during connection cleans its in-flight process', async () => {

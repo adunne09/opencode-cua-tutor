@@ -11,7 +11,7 @@ import { PNG } from 'pngjs';
 import { axCandidates } from '../src/candidates.js';
 import { bufferedFetch, decide, liveChooser, MAX_ACTIONS, mockChooser, snapToCandidate, type Chooser } from '../src/jev.js';
 import { Tutor } from '../src/tutor.js';
-import { CuaDriver, driverEnvironment } from '../src/driver.js';
+import { CuaDriver, NoWindowError, driverEnvironment } from '../src/driver.js';
 import { CROP_SIDE, cropCandidate, decodeScreenshot } from '../src/visual.js';
 
 describe('config', () => {
@@ -283,7 +283,7 @@ describe('end to end with a fake Cua Driver (mock Jev)', () => {
       driver.findWindow = async (app, sig) => {
         if (app === 'LaunchMe') {
           calls++;
-          if (calls === 1) throw new Error('LaunchMe has no on-screen window. Open it first.');
+          if (calls === 1) throw new NoWindowError('LaunchMe');
           return { pid: 55, window_id: 77, app_name: 'LaunchMe', title: 'Welcome' };
         }
         return origFind(app, sig);
